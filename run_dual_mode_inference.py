@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,17 +14,15 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor
+from scipy.stats import linregress
 
-from build_social_features import (
-    extract_social_features,
-    filter_pre_release_entries,
-    format_release_datetime,
-    parse_timeline_json,
-)
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
 from train_streaming_hurdle import (
     FEATURE_COLUMNS,
-    SOCIAL_RATIO_COLUMNS,
-    SOCIAL_VOLUME_COLUMNS,
     STAGE3_FEATURE_COLUMNS,
     STAGE_LABEL_GATEKEEPER,
     STAGE_LABEL_STANDARD,
@@ -53,6 +52,30 @@ GATEKEEPER_PROB_THRESHOLD = 0.5 #default that should get replaced by optimal fro
 RAW_STREAM_FLOOR = 500.0
 DEFAULT_TRACKS = 12
 DEFAULT_HITS = 1
+SNOWFLAKE_ENV_PATH = Path("secrets/amg_research.env")
+SNOWFLAKE_BASE_ENV_VARS = (
+    "SNOWFLAKE_USER",
+    "SNOWFLAKE_ACCOUNT",
+    "SNOWFLAKE_WAREHOUSE",
+    "SNOWFLAKE_ROLE",
+)
+LIVE_CATALOG_SQL = """
+SELECT
+    FLOOR(DATEDIFF(DAY, asd.report_date, CURRENT_DATE()) / 7) AS weeks_prior_to_release,
+    COALESCE(SUM(IFF(
+        asd.metric_category = 'Streams'
+        AND asd.service_type = 'OnDemand'
+        AND asd.content_type = 'Audio',
+        asd.quantity, 0
+    )), 0) AS weekly_catalog_streams
+FROM LUMINATE_PROD.EXTRACT_S.VW_DAILY_FACT_ARTIST_SUMMARY_DS asd
+WHERE asd.COUNTRY_CODE = 'AA'
+    AND asd.ARTIST_ID = %(artist_id)s
+    AND asd.report_date >= DATEADD(DAY, -84, CURRENT_DATE())
+    AND asd.report_date < CURRENT_DATE()
+GROUP BY ALL
+ORDER BY weeks_prior_to_release ASC
+"""
 
 _peer_benchmarks_cache: pd.DataFrame | None = None
 
@@ -95,6 +118,12 @@ def parse_args() -> argparse.Namespace:
         help="Artist display name (required for A&R Sandbox or ML single-shot mode)",
     )
     parser.add_argument(
+        "--artist-id",
+        type=str,
+        default=None,
+        help="Luminate Artist ID for real-time Snowflake catalog metric extraction",
+    )
+    parser.add_argument(
         "--tracks",
         type=int,
         default=DEFAULT_TRACKS,
@@ -125,27 +154,6 @@ def parse_args() -> argparse.Namespace:
         help="W2/W1 retention ratio for ML single-shot mode",
     )
     parser.add_argument(
-        "--raw-ig-hype",
-        type=float,
-        default=None,
-        help="Current raw IG hype multiplier for ML single-shot mode",
-    )
-    parser.add_argument(
-        "--tt-outlier-reach",
-        type=float,
-        default=None,
-        help="Current TikTok outlier reach for ML single-shot mode",
-    )
-    parser.add_argument(
-        "--social-csv",
-        type=Path,
-        default=None,
-        help=(
-            "Path to a Snowflake CSV export containing POSTS_TIMELINE_DATA and "
-            "TIKTOK_VIDEO_TIMELINE_DATA JSON arrays."
-        ),
-    )
-    parser.add_argument(
         "--input-file",
         type=Path,
         default=None,
@@ -164,6 +172,160 @@ def parse_args() -> argparse.Namespace:
         help="Total global tracking streams for the current week (universe denominator)",
     )
     return parser.parse_args()
+
+
+def load_snowflake_env() -> None:
+    """Load Snowflake credentials from secrets/amg_research.env."""
+    if not SNOWFLAKE_ENV_PATH.exists():
+        raise EnvironmentError(
+            f"Snowflake env file not found: {SNOWFLAKE_ENV_PATH}. "
+            "Copy secrets/amg_research.env.example and fill in credentials."
+        )
+
+    if load_dotenv is not None:
+        load_dotenv(SNOWFLAKE_ENV_PATH)
+
+
+def _load_snowflake_private_key() -> bytes:
+    """Load a PKCS#8 private key for Snowflake key-pair authentication."""
+    try:
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import serialization
+    except ImportError as exc:
+        raise ImportError(
+            "cryptography is required for Snowflake key-pair auth. "
+            "Install with: pip install cryptography"
+        ) from exc
+
+    key_path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
+    key_pem = os.getenv("SNOWFLAKE_PRIVATE_KEY")
+    passphrase = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
+
+    if key_path:
+        key_data = Path(key_path).expanduser().read_bytes()
+    elif key_pem:
+        key_data = key_pem.replace("\\n", "\n").encode()
+    else:
+        raise EnvironmentError(
+            "Key-pair auth requires SNOWFLAKE_PRIVATE_KEY_PATH or SNOWFLAKE_PRIVATE_KEY."
+        )
+
+    private_key = serialization.load_pem_private_key(
+        key_data,
+        password=passphrase.encode() if passphrase else None,
+        backend=default_backend(),
+    )
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
+def get_snowflake_connection():
+    """Open a Snowflake connection using secrets/amg_research.env credentials."""
+    try:
+        import snowflake.connector
+    except ImportError as exc:
+        raise ImportError(
+            "snowflake-connector-python is required for live catalog extraction. "
+            f"Install with: {sys.executable} -m pip install snowflake-connector-python "
+            "(current interpreter: "
+            f"{sys.executable})"
+        ) from exc
+
+    load_snowflake_env()
+    missing = [var for var in SNOWFLAKE_BASE_ENV_VARS if not os.getenv(var)]
+    if missing:
+        raise EnvironmentError(
+            f"Missing Snowflake environment variables: {', '.join(missing)}"
+        )
+
+    connect_kwargs: dict[str, Any] = {
+        "user": os.environ["SNOWFLAKE_USER"],
+        "account": os.environ["SNOWFLAKE_ACCOUNT"],
+        "warehouse": os.environ["SNOWFLAKE_WAREHOUSE"],
+        "role": os.environ["SNOWFLAKE_ROLE"],
+    }
+
+    database = os.getenv("SNOWFLAKE_DATABASE")
+    schema = os.getenv("SNOWFLAKE_SCHEMA")
+    if database:
+        connect_kwargs["database"] = database
+    if schema:
+        connect_kwargs["schema"] = schema
+
+    auth_method = os.getenv("SNOWFLAKE_AUTH_METHOD", "password").lower()
+    if auth_method == "key_pair":
+        connect_kwargs["private_key"] = _load_snowflake_private_key()
+    else:
+        password = os.getenv("SNOWFLAKE_PASSWORD")
+        if not password:
+            raise EnvironmentError(
+                "Password auth requires SNOWFLAKE_PASSWORD in secrets/amg_research.env."
+            )
+        connect_kwargs["password"] = password
+
+    return snowflake.connector.connect(**connect_kwargs)
+
+
+def compute_catalog_velocity_slope(weekly_catalog: pd.DataFrame) -> float:
+    """Mirror build_streaming_features.compute_catalog_velocity on a weekly frame."""
+    sorted_weeks = weekly_catalog.sort_values("WEEKS_PRIOR_TO_RELEASE", ascending=False)
+    if len(sorted_weeks) < 2:
+        return 0.0
+
+    x = np.arange(len(sorted_weeks))
+    y = sorted_weeks["WEEKLY_CATALOG_STREAMS"].to_numpy(dtype=float)
+    try:
+        slope, _, _, _, _ = linregress(x, y)
+    except ValueError:
+        return 0.0
+    return float(slope)
+
+
+def compute_short_term_spike_ratio(weekly_catalog: pd.DataFrame) -> float:
+    """Mirror build_streaming_features.compute_short_term_spike on a weekly frame."""
+    sorted_weeks = weekly_catalog.sort_values("WEEKS_PRIOR_TO_RELEASE", ascending=True)
+    if len(sorted_weeks) < 2:
+        return 1.0
+
+    w1_streams = float(sorted_weeks.iloc[0]["WEEKLY_CATALOG_STREAMS"])
+    w2_w4_streams = float(sorted_weeks.iloc[1:4]["WEEKLY_CATALOG_STREAMS"].mean())
+    if w2_w4_streams == 0:
+        return 1.0 if w1_streams == 0 else 2.0
+
+    return float(np.clip(w1_streams / w2_w4_streams, 0.5, 4.0))
+
+
+def fetch_live_catalog_metrics(artist_id: str) -> tuple[float, float]:
+    """Pull the last 12 weeks of catalog streams from Snowflake and engineer live metrics."""
+    connection = get_snowflake_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(LIVE_CATALOG_SQL, {"artist_id": artist_id})
+        rows = cursor.fetchall()
+        columns = [col[0] for col in cursor.description]
+    finally:
+        connection.close()
+
+    if not rows:
+        raise ValueError(
+            f"No catalog stream rows returned from Snowflake for ARTIST_ID={artist_id}"
+        )
+
+    weekly_catalog = pd.DataFrame(rows, columns=columns)
+    weekly_catalog.columns = weekly_catalog.columns.str.upper()
+    weekly_catalog["WEEKS_PRIOR_TO_RELEASE"] = weekly_catalog["WEEKS_PRIOR_TO_RELEASE"].astype(
+        int
+    )
+    weekly_catalog["WEEKLY_CATALOG_STREAMS"] = weekly_catalog["WEEKLY_CATALOG_STREAMS"].astype(
+        float
+    )
+
+    catalog_velocity_slope = compute_catalog_velocity_slope(weekly_catalog)
+    short_term_spike_ratio = compute_short_term_spike_ratio(weekly_catalog)
+    return catalog_velocity_slope, short_term_spike_ratio
 
 
 def format_streams(value: float) -> str:
@@ -396,22 +558,8 @@ def sanitize_features(df: pd.DataFrame, feature_columns: list[str]) -> pd.DataFr
 
 
 def prepare_rollout_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Impute social features, engineer Stage 3 columns, and sanitize SPB inputs."""
-    prepared = df.copy()
-
-    present_volume_cols = [col for col in SOCIAL_VOLUME_COLUMNS if col in prepared.columns]
-    present_ratio_cols = [col for col in SOCIAL_RATIO_COLUMNS if col in prepared.columns]
-    if present_volume_cols:
-        prepared[present_volume_cols] = prepared[present_volume_cols].fillna(0.0)
-    if present_ratio_cols:
-        prepared[present_ratio_cols] = prepared[present_ratio_cols].fillna(1.0)
-
-    if "RAW_IG_LATE_STAGE_HYPE" not in prepared.columns:
-        prepared["RAW_IG_LATE_STAGE_HYPE"] = 1.0
-    else:
-        prepared["RAW_IG_LATE_STAGE_HYPE"] = prepared["RAW_IG_LATE_STAGE_HYPE"].fillna(1.0)
-
-    prepared = engineer_stage3_features(prepared)
+    """Sanitize rollout features before three-stage inference."""
+    prepared = engineer_stage3_features(df.copy())
 
     spb_columns = [
         col
@@ -542,22 +690,12 @@ def print_ml_report(
         active_singles = row.get("ACTIVE_SINGLE_COUNT", np.nan)
         lead_peak = row.get("LEAD_SINGLE_PEAK_VOLUME", np.nan)
         retention = row.get("RETENTION_RATIO", np.nan)
-        ig_hype = row.get("IG_LATE_STAGE_HYPE", np.nan)
-        raw_ig_hype = row.get("RAW_IG_LATE_STAGE_HYPE", np.nan)
-        tt_reach = row.get("TT_OUTLIER_REACH", np.nan)
 
         print(f"\n{label}")
         print("-" * 72)
         print(f"  Active Singles:        {int(active_singles) if pd.notna(active_singles) else 'N/A'}")
         print(f"  Lead Single W1 Volume: {format_streams(float(lead_peak)) if pd.notna(lead_peak) else 'N/A'}")
         print(f"  Retention Ratio:       {format_percent(float(retention)) if pd.notna(retention) else 'N/A'}")
-        print(f"  IG Late-Stage Hype:    {float(ig_hype):.2f}" if pd.notna(ig_hype) else "  IG Late-Stage Hype:    N/A")
-        print(
-            f"  Raw IG Hype:           {float(raw_ig_hype):.2f}"
-            if pd.notna(raw_ig_hype)
-            else "  Raw IG Hype:           N/A"
-        )
-        print(f"  TT Outlier Reach:      {float(tt_reach):.2f}" if pd.notna(tt_reach) else "  TT Outlier Reach:      N/A")
         print(f"  Gatekeeper Prob:       {probabilities[pos]:.1%}")
         print(f"  Prediction Stage:      {stage_label}")
         if not np.isnan(predicted_spb[pos]):
@@ -577,78 +715,14 @@ def print_ml_report(
     print("=" * 72 + "\n")
 
 
-def extract_social_multipliers_from_csv(csv_path: Path) -> tuple[float | None, float | None]:
-    """Compute RAW_IG_LATE_STAGE_HYPE and TT_OUTLIER_REACH from a Snowflake social export."""
-    if not csv_path.exists():
-        print(f"Warning: Social CSV not found: {csv_path}", file=sys.stderr)
-        return None, None
-
-    try:
-        social_df = pd.read_csv(csv_path)
-    except (OSError, pd.errors.ParserError, ValueError) as exc:
-        print(f"Warning: Failed to read social CSV ({csv_path}): {exc}", file=sys.stderr)
-        return None, None
-
-    if social_df.empty:
-        print(f"Warning: Social CSV is empty: {csv_path}", file=sys.stderr)
-        return None, None
-
-    social_df.columns = social_df.columns.str.upper()
-    row_series = social_df.iloc[0]
-
-    if "FIRST_SALE_DATE" not in social_df.columns:
-        print(
-            "Warning: Social CSV is missing FIRST_SALE_DATE; cannot compute social multipliers.",
-            file=sys.stderr,
-        )
-        return None, None
-
-    first_sale_date = pd.to_datetime(row_series["FIRST_SALE_DATE"], errors="coerce")
-    if pd.isna(first_sale_date):
-        print(
-            "Warning: Social CSV has an invalid FIRST_SALE_DATE; cannot compute social multipliers.",
-            file=sys.stderr,
-        )
-        return None, None
-
-    row_df = social_df.iloc[[0]].copy()
-    row_df["FIRST_SALE_DATE"] = first_sale_date
-    row = next(row_df.itertuples(index=False))
-    features = extract_social_features(row)
-
-    first_sale_date_str = format_release_datetime(first_sale_date)
-    raw_ig_hype: float | None = None
-    tt_outlier_reach: float | None = None
-
-    if "POSTS_TIMELINE_DATA" in social_df.columns:
-        valid_ig_posts = filter_pre_release_entries(
-            parse_timeline_json(row_series.get("POSTS_TIMELINE_DATA")),
-            first_sale_date_str,
-        )
-        if valid_ig_posts:
-            raw_ig_hype = float(features["RAW_IG_LATE_STAGE_HYPE"])
-
-    if "TIKTOK_VIDEO_TIMELINE_DATA" in social_df.columns:
-        valid_tt_videos = filter_pre_release_entries(
-            parse_timeline_json(row_series.get("TIKTOK_VIDEO_TIMELINE_DATA")),
-            first_sale_date_str,
-        )
-        if valid_tt_videos:
-            tt_value = features.get("TT_OUTLIER_REACH", np.nan)
-            if pd.notna(tt_value):
-                tt_outlier_reach = float(tt_value)
-
-    return raw_ig_hype, tt_outlier_reach
-
-
 def build_single_shot_df(
     artist: str,
     tracks: int,
     lead_volume: float,
     active_singles: int,
     retention: float,
-    raw_ig_hype: float | None,
-    tt_outlier_reach: float | None,
+    catalog_velocity_slope: float | None = None,
+    short_term_spike_ratio: float | None = None,
 ) -> pd.DataFrame:
     """Hydrate historical features for an artist and inject hypothetical rollout data."""
     if not FEATURE_MATRIX_PATH.exists():
@@ -677,19 +751,9 @@ def build_single_shot_df(
                 "HISTORICAL_STANDARD_TRACK_SPB": np.nan,
                 "HISTORICAL_MACRO_MOMENTUM": 0.0,
                 "SHORT_TERM_SPIKE_RATIO": 1.0,
-                "RAW_IG_LATE_STAGE_HYPE": 1.0,
             }
         )
         is_debut = 1
-
-    for col in SOCIAL_VOLUME_COLUMNS:
-        if col not in base_row.index or pd.isna(base_row.get(col)):
-            base_row[col] = 0.0
-    for col in SOCIAL_RATIO_COLUMNS:
-        if col not in base_row.index or pd.isna(base_row.get(col)):
-            base_row[col] = 1.0
-    if pd.isna(base_row.get("RAW_IG_LATE_STAGE_HYPE")):
-        base_row["RAW_IG_LATE_STAGE_HYPE"] = 1.0
 
     base_row["TOTAL_TRACKS_ANALYZED"] = tracks
     base_row["LEAD_SINGLE_PEAK_VOLUME"] = lead_volume
@@ -697,16 +761,15 @@ def build_single_shot_df(
     base_row["RETENTION_RATIO"] = retention if lead_volume > 0 else np.nan
     base_row["IS_DEBUT_ALBUM"] = is_debut
 
+    if catalog_velocity_slope is not None:
+        base_row["CATALOG_VELOCITY_SLOPE"] = catalog_velocity_slope
+    if short_term_spike_ratio is not None:
+        base_row["SHORT_TERM_SPIKE_RATIO"] = short_term_spike_ratio
+
     velocity = float(base_row.get("CATALOG_VELOCITY_SLOPE", 0.0))
     if pd.isna(velocity):
         velocity = 0.0
     base_row["VELOCITY_X_SINGLES"] = velocity * active_singles
-
-    if raw_ig_hype is not None:
-        base_row["RAW_IG_LATE_STAGE_HYPE"] = raw_ig_hype
-        base_row["IG_LATE_STAGE_HYPE"] = min(raw_ig_hype, 10.0)
-    if tt_outlier_reach is not None:
-        base_row["TT_OUTLIER_REACH"] = tt_outlier_reach
 
     return prepare_rollout_features(pd.DataFrame([base_row]))
 
@@ -801,32 +864,22 @@ def main() -> None:
             )
             sys.exit(1)
 
-        raw_ig_hype = args.raw_ig_hype
-        tt_outlier_reach = args.tt_outlier_reach
-
-        if args.social_csv is not None:
-            if not args.social_csv.exists():
-                print(f"Error: Social CSV not found: {args.social_csv}", file=sys.stderr)
+        catalog_velocity_slope: float | None = None
+        short_term_spike_ratio: float | None = None
+        if args.artist_id:
+            try:
+                catalog_velocity_slope, short_term_spike_ratio = fetch_live_catalog_metrics(
+                    args.artist_id
+                )
+            except (EnvironmentError, ImportError, ValueError) as exc:
+                print(f"Error: Failed to fetch live catalog metrics: {exc}", file=sys.stderr)
                 sys.exit(1)
 
-            csv_raw_ig_hype, csv_tt_outlier_reach = extract_social_multipliers_from_csv(
-                args.social_csv
-            )
-            print("\nExtracted Social Multipliers from CSV:")
+            print("\nLive Snowflake Catalog Metrics:")
             print("-" * 72)
-            print(
-                f"  RAW_IG_LATE_STAGE_HYPE: "
-                f"{csv_raw_ig_hype if csv_raw_ig_hype is not None else 'N/A (historical fallback)'}"
-            )
-            print(
-                f"  TT_OUTLIER_REACH:       "
-                f"{csv_tt_outlier_reach if csv_tt_outlier_reach is not None else 'N/A (historical fallback)'}"
-            )
-
-            if raw_ig_hype is None:
-                raw_ig_hype = csv_raw_ig_hype
-            if tt_outlier_reach is None:
-                tt_outlier_reach = csv_tt_outlier_reach
+            print(f"  ARTIST_ID:                {args.artist_id}")
+            print(f"  CATALOG_VELOCITY_SLOPE:   {catalog_velocity_slope:,.2f}")
+            print(f"  SHORT_TERM_SPIKE_RATIO:   {short_term_spike_ratio:.4f}")
 
         synthetic_df = build_single_shot_df(
             artist=args.artist,
@@ -834,8 +887,8 @@ def main() -> None:
             lead_volume=args.lead_single_volume,
             active_singles=args.active_singles,
             retention=args.retention_ratio,
-            raw_ig_hype=raw_ig_hype,
-            tt_outlier_reach=tt_outlier_reach,
+            catalog_velocity_slope=catalog_velocity_slope,
+            short_term_spike_ratio=short_term_spike_ratio,
         )
 
         print("\nGenerated Synthetic Rollout Features:")
@@ -845,10 +898,6 @@ def main() -> None:
             "CATALOG_VELOCITY_SLOPE",
             "VELOCITY_X_SINGLES",
             "SHORT_TERM_SPIKE_RATIO",
-            "IG_LATE_STAGE_HYPE",
-            "RAW_IG_LATE_STAGE_HYPE",
-            "SUPERSTAR_MOMENTUM_INDEX",
-            "TT_OUTLIER_REACH",
         ]:
             print(f"  {col}: {synthetic_df.iloc[0].get(col, 'N/A')}")
 

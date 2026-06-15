@@ -44,39 +44,9 @@ FEATURE_COLUMNS: list[str] = [
     "IS_DEBUT_ALBUM",
     "VELOCITY_X_SINGLES",
     "SHORT_TERM_SPIKE_RATIO",
-    "TOTAL_PRE_RELEASE_IG_FAVES",
-    "TOTAL_PRE_RELEASE_IG_COMMENTS",
-    "IG_AVG_ENGAGEMENT_RATE",
-    "IG_COMMENT_DENSITY",
-    "IG_LATE_STAGE_HYPE",
-    "TOTAL_PRE_RELEASE_TT_PLAYS",
-    "TT_SHARE_VELOCITY",
-    "TT_OUTLIER_REACH",
 ]
-SOCIAL_VOLUME_COLUMNS = [
-    "TOTAL_PRE_RELEASE_IG_FAVES",
-    "TOTAL_PRE_RELEASE_IG_COMMENTS",
-    "TOTAL_PRE_RELEASE_TT_PLAYS",
-]
-SOCIAL_RATIO_COLUMNS = [
-    "IG_AVG_ENGAGEMENT_RATE",
-    "IG_COMMENT_DENSITY",
-    "IG_LATE_STAGE_HYPE",
-    "RAW_IG_LATE_STAGE_HYPE",
-    "TT_SHARE_VELOCITY",
-    "TT_OUTLIER_REACH",
-]
-STAGE3_PARQUET_COLUMNS = ["RAW_IG_LATE_STAGE_HYPE"]
-STAGE3_DERIVED_COLUMNS = ["SUPERSTAR_MOMENTUM_INDEX"]
-STAGE3_FEATURE_COLUMNS = FEATURE_COLUMNS + STAGE3_PARQUET_COLUMNS + STAGE3_DERIVED_COLUMNS
-MONOTONE_POSITIVE_FEATURES = {
-    "IG_LATE_STAGE_HYPE",
-    "RAW_IG_LATE_STAGE_HYPE",
-    "TT_OUTLIER_REACH",
-    "IG_COMMENT_DENSITY",
-    "TT_SHARE_VELOCITY",
-    "SUPERSTAR_MOMENTUM_INDEX",
-}
+STAGE3_FEATURE_COLUMNS = list(FEATURE_COLUMNS)
+MONOTONE_POSITIVE_FEATURES: set[str] = set()
 EXCLUDED_FROM_TRAINING: list[str] = [
     "ARTIST_ID",
     "MRELG_ID",
@@ -185,18 +155,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def engineer_stage3_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add Stage 3 compounding multipliers used by the superstar regressor."""
-    enriched = df.copy()
-    if "RAW_IG_LATE_STAGE_HYPE" in enriched.columns:
-        enriched["RAW_IG_LATE_STAGE_HYPE"] = enriched["RAW_IG_LATE_STAGE_HYPE"].fillna(1.0)
-    else:
-        raise ValueError(
-            "RAW_IG_LATE_STAGE_HYPE missing from parquet. Update social features."
-        )
-
-    historical_spb = enriched["HISTORICAL_STANDARD_TRACK_SPB"].fillna(0.0)
-    enriched["SUPERSTAR_MOMENTUM_INDEX"] = historical_spb * enriched["RAW_IG_LATE_STAGE_HYPE"]
-    return enriched
+    """Return Stage 3 inputs (pre-social baseline uses the same feature set as Stage 2)."""
+    return df.copy()
 
 
 def load_and_clean_data(path: Path) -> tuple[pd.DataFrame, TrainingCounts]:

@@ -1,4 +1,9 @@
-"""Engineer pre-release Instagram and TikTok velocity features from nested JSON timelines."""
+"""Engineer pre-release Instagram and TikTok velocity features from nested JSON timelines.
+
+DEPRECATED: This module is not used by the Cold Harbor Hits production pipeline.
+The Three-Stage Hurdle architecture reverted to the pre-social streaming baseline.
+Do not run this script as part of build_streaming_features.py or model training.
+"""
 
 from __future__ import annotations
 
@@ -176,6 +181,10 @@ def process_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
 
 
 def main() -> None:
+    print(
+        "WARNING: build_social_features.py is deprecated and ignored by the production pipeline."
+    )
+    print("Reverting to pre-social baseline — no social_features.parquet will be consumed.")
     if not INPUT_PATH.exists():
         raise FileNotFoundError(f"Input file not found: {INPUT_PATH}")
 

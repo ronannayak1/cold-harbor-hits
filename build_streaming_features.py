@@ -13,22 +13,6 @@ LEAD_SINGLES_PATH = DATA_DIR / "lead_single_album_map_streams.csv"
 CATALOG_STREAMS_PATH = DATA_DIR / "artist_catalog_streams_12w.csv"
 FEATURE_MATRIX_PATH = DATA_DIR / "album_meta_features.parquet"
 SANDBOX_BASELINES_PATH = DATA_DIR / "artist_sandbox_baselines.csv"
-SOCIAL_FEATURES_PATH = DATA_DIR / "social_features.parquet"
-
-SOCIAL_VOLUME_COLUMNS = [
-    "TOTAL_PRE_RELEASE_IG_FAVES",
-    "TOTAL_PRE_RELEASE_IG_COMMENTS",
-    "TOTAL_PRE_RELEASE_TT_PLAYS",
-]
-SOCIAL_RATIO_COLUMNS = [
-    "IG_AVG_ENGAGEMENT_RATE",
-    "IG_COMMENT_DENSITY",
-    "IG_LATE_STAGE_HYPE",
-    "RAW_IG_LATE_STAGE_HYPE",
-    "TT_SHARE_VELOCITY",
-    "TT_OUTLIER_REACH",
-]
-SOCIAL_FEATURE_COLUMNS = SOCIAL_VOLUME_COLUMNS + SOCIAL_RATIO_COLUMNS
 
 
 def load_csv_uppercase(path: Path) -> pd.DataFrame:
@@ -188,35 +172,6 @@ def build_feature_matrix(
     return features
 
 
-def merge_social_features(feature_matrix: pd.DataFrame) -> pd.DataFrame:
-    """Left-join social velocity features and apply targeted imputation for missing albums."""
-    if not SOCIAL_FEATURES_PATH.exists():
-        raise FileNotFoundError(
-            f"Social features not found: {SOCIAL_FEATURES_PATH}. Run build_social_features.py first."
-        )
-
-    social_df = pd.read_parquet(SOCIAL_FEATURES_PATH)
-    if "MRELG_ID" not in social_df.columns:
-        raise ValueError("social_features.parquet is missing required join key: MRELG_ID")
-
-    missing_social_cols = set(SOCIAL_FEATURE_COLUMNS) - set(social_df.columns)
-    if missing_social_cols:
-        raise ValueError(
-            f"social_features.parquet is missing required columns: {sorted(missing_social_cols)}"
-        )
-
-    social_df = (
-        social_df[["MRELG_ID", *SOCIAL_FEATURE_COLUMNS]]
-        .drop_duplicates(subset="MRELG_ID", keep="last")
-    )
-
-    merged = feature_matrix.merge(social_df, on="MRELG_ID", how="left")
-
-    imputation_map = {col: 0.0 for col in SOCIAL_VOLUME_COLUMNS}
-    imputation_map.update({col: 1.0 for col in SOCIAL_RATIO_COLUMNS})
-    return merged.fillna(imputation_map)
-
-
 def build_sandbox_baselines(
     feature_matrix: pd.DataFrame, lambda_decay: float = 0.5
 ) -> pd.DataFrame:
@@ -284,7 +239,6 @@ def summarize_dataframe(df: pd.DataFrame, label: str) -> None:
         "HISTORICAL_MACRO_MOMENTUM",
         "IS_DEBUT_ALBUM",
         "SHORT_TERM_SPIKE_RATIO",
-        *SOCIAL_FEATURE_COLUMNS,
     ]
     present_cols = [c for c in key_cols if c in df.columns]
     if present_cols:
@@ -315,10 +269,6 @@ def main() -> None:
     feature_matrix = build_feature_matrix(
         base_df, historical_df, singles_features, velocity_features, spike_features
     )
-
-    print("\nMerging social velocity features...")
-    feature_matrix = merge_social_features(feature_matrix)
-    print(f"  Social features joined: {len(SOCIAL_FEATURE_COLUMNS)} columns")
 
     summarize_dataframe(feature_matrix, "Album Meta Feature Matrix")
 

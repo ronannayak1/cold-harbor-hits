@@ -21,8 +21,6 @@ from train_streaming_hurdle import (
     EXCLUDED_FROM_TRAINING,
     FEATURE_COLUMNS,
     GATEKEEPER_PERCENTILE,
-    SOCIAL_RATIO_COLUMNS,
-    SOCIAL_VOLUME_COLUMNS,
     STAGE3_FEATURE_COLUMNS,
     STAGE_LABEL_GATEKEEPER,
     STAGE_LABEL_STANDARD,
@@ -134,7 +132,6 @@ def load_and_prepare_data(path: Path) -> pd.DataFrame:
         "DISPLAY_ARTIST",
         "GENRE",
         "LEVEL_2_DISTRIBUTOR",
-        "RAW_IG_LATE_STAGE_HYPE",
         *FEATURE_COLUMNS,
     }
     missing_columns = required_columns - set(df.columns)
@@ -146,13 +143,6 @@ def load_and_prepare_data(path: Path) -> pd.DataFrame:
     clean_df = clean_df[clean_df[TARGET_COLUMN] > 0]
     clean_df = clean_df[clean_df[ACTUAL_STREAMS_COLUMN] > 0]
     clean_df = clean_df[clean_df["TOTAL_TRACKS_ANALYZED"] >= 2]
-
-    present_volume_cols = [col for col in SOCIAL_VOLUME_COLUMNS if col in clean_df.columns]
-    present_ratio_cols = [col for col in SOCIAL_RATIO_COLUMNS if col in clean_df.columns]
-    if present_volume_cols:
-        clean_df[present_volume_cols] = clean_df[present_volume_cols].fillna(0.0)
-    if present_ratio_cols:
-        clean_df[present_ratio_cols] = clean_df[present_ratio_cols].fillna(1.0)
 
     clean_df = engineer_stage3_features(clean_df)
     clean_df = sanitize_prediction_features(clean_df)
