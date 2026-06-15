@@ -1,0 +1,17 @@
+# Data & Datasets
+data/*.csv
+data/*.parquet
+
+# Model Artifacts & Tuning Caches
+models/*.joblib
+models/*.txt
+models/*.json
+.optuna/
+*.log
+
+# Python Environment & OS Cache
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+env/
