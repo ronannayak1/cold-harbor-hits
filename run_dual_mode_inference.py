@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,7 @@ CLASSIFIER_PATH = MODELS_DIR / "streaming_hurdle_classifier.txt"
 REGRESSOR_PATH = MODELS_DIR / "streaming_hurdle_regressor.joblib"
 SUPERSTAR_REGRESSOR_PATH = MODELS_DIR / "streaming_superstar_regressor.joblib"
 META_PATH = MODELS_DIR / "streaming_hurdle_meta.json"
+CHARTEX_MULTIPLIER_PATH = MODELS_DIR / "chartex_multiplier_regressor.joblib"
 
 ALBUM_SKEW_MULTIPLIER = 3.78
 HYPE_CONVERSION_DIVISOR = 2.01
@@ -61,7 +63,7 @@ SNOWFLAKE_BASE_ENV_VARS = (
 )
 LIVE_CATALOG_SQL = """
 SELECT
-    FLOOR(DATEDIFF(DAY, asd.report_date, CURRENT_DATE()) / 7) AS weeks_prior_to_release,
+    FLOOR(DATEDIFF(DAY, asd.report_date, %(anchor_date)s) / 7) AS weeks_prior_to_release,
     COALESCE(SUM(IFF(
         asd.metric_category = 'Streams'
         AND asd.service_type = 'OnDemand'
@@ -71,11 +73,61 @@ SELECT
 FROM LUMINATE_PROD.EXTRACT_S.VW_DAILY_FACT_ARTIST_SUMMARY_DS asd
 WHERE asd.COUNTRY_CODE = 'AA'
     AND asd.ARTIST_ID = %(artist_id)s
-    AND asd.report_date >= DATEADD(DAY, -84, CURRENT_DATE())
-    AND asd.report_date < CURRENT_DATE()
+    AND asd.report_date >= DATEADD(DAY, -84, %(anchor_date)s)
+    AND asd.report_date < %(anchor_date)s
 GROUP BY ALL
 ORDER BY weeks_prior_to_release ASC
 """
+LIVE_CHARTEX_SQL = """
+WITH artist_meta AS (
+    SELECT artist_name
+    FROM CURRENT_DEV.DATA.ARTIST_METADATA
+    WHERE luminate_artist_id = %(artist_id)s
+    LIMIT 1
+),
+chartex_snapshots AS (
+    SELECT ctd.*
+    FROM CURRENT_DEV.DATA.CHARTEX_TIKTOK_DATA ctd
+    JOIN artist_meta am ON LOWER(ctd.artists) = LOWER(am.artist_name)
+    WHERE DATE(ctd.created_at) <= %(anchor_date)s
+),
+pre_release_velocity AS (
+    SELECT *
+    FROM chartex_snapshots
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY tiktok_sound_id
+        ORDER BY created_at DESC
+    ) = 1
+)
+SELECT
+    COUNT(DISTINCT tiktok_sound_id) AS trending_sounds_count,
+    SUM(tiktok_total_video_count) AS album_total_tt_videos,
+    SUM(tiktok_last_7_days_video_count) AS album_tt_videos_last_7d,
+    SUM(tiktok_last_24_hours_video_count) AS album_tt_videos_last_24h,
+    SUM(total_video_views) AS album_total_tt_views,
+    SUM(total_video_likes) AS album_total_tt_likes,
+    SUM(total_video_saves) AS album_total_tt_saves,
+    SUM(total_video_shares) AS album_total_tt_shares
+FROM pre_release_velocity
+"""
+
+CHARTEX_RAW_COLUMNS = [
+    "TRENDING_SOUNDS_COUNT",
+    "ALBUM_TOTAL_TT_VIDEOS",
+    "ALBUM_TT_VIDEOS_LAST_7D",
+    "ALBUM_TT_VIDEOS_LAST_24H",
+    "ALBUM_TOTAL_TT_VIEWS",
+    "ALBUM_TOTAL_TT_LIKES",
+    "ALBUM_TOTAL_TT_SAVES",
+    "ALBUM_TOTAL_TT_SHARES",
+]
+
+CHARTEX_ENGINEERED_COLUMNS = [
+    "TT_VIRAL_CONCENTRATION",
+    "TT_TERMINAL_ACCELERATION",
+    "TT_ENGAGEMENT_DEPTH",
+    "TT_LIKE_RATIO",
+]
 
 _peer_benchmarks_cache: pd.DataFrame | None = None
 
@@ -121,7 +173,16 @@ def parse_args() -> argparse.Namespace:
         "--artist-id",
         type=str,
         default=None,
-        help="Luminate Artist ID for real-time Snowflake catalog metric extraction",
+        help="Luminate Artist ID for real-time Snowflake catalog and Chartex extraction",
+    )
+    parser.add_argument(
+        "--first-sale-date",
+        type=str,
+        default=None,
+        help=(
+            "Target release date (YYYY-MM-DD). Data extraction anchors to the earlier "
+            "of this date and today."
+        ),
     )
     parser.add_argument(
         "--tracks",
@@ -298,23 +359,84 @@ def compute_short_term_spike_ratio(weekly_catalog: pd.DataFrame) -> float:
     return float(np.clip(w1_streams / w2_w4_streams, 0.5, 4.0))
 
 
-def fetch_live_catalog_metrics(artist_id: str) -> tuple[float, float]:
-    """Pull the last 12 weeks of catalog streams from Snowflake and engineer live metrics."""
+def resolve_anchor_date(first_sale_date: str | None) -> str:
+    """Return YYYY-MM-DD anchor: min(today, release date) when provided, else today."""
+    today = datetime.today().date()
+    if first_sale_date:
+        parsed_date = datetime.strptime(first_sale_date, "%Y-%m-%d").date()
+        anchor_date_obj = min(today, parsed_date)
+    else:
+        anchor_date_obj = today
+    return anchor_date_obj.strftime("%Y-%m-%d")
+
+
+def _chartex_row_is_empty(chartex_row: pd.Series | None) -> bool:
+    """True when Chartex returned no usable TikTok aggregates before the anchor date."""
+    if chartex_row is None or chartex_row.empty:
+        return True
+    values = chartex_row.reindex(CHARTEX_RAW_COLUMNS)
+    return bool(values.isna().all())
+
+
+def _safe_ratio(numerator: Any, denominator: float) -> float:
+    """Divide safely, preserving NaN when the numerator is missing."""
+    if pd.isna(numerator):
+        return np.nan
+    return float(numerator) / denominator
+
+
+def engineer_live_chartex_features(chartex_row: pd.Series) -> dict[str, float]:
+    """Engineer TikTok ratios for inference; empty rows propagate NaN to LightGBM."""
+    engineered: dict[str, float] = {col: np.nan for col in CHARTEX_ENGINEERED_COLUMNS}
+    if _chartex_row_is_empty(chartex_row):
+        return engineered
+
+    safe_total_videos = max(float(chartex_row["ALBUM_TOTAL_TT_VIDEOS"] or 0.0), 1.0)
+    safe_total_views = max(float(chartex_row["ALBUM_TOTAL_TT_VIEWS"] or 0.0), 1.0)
+
+    engineered["TT_VIRAL_CONCENTRATION"] = _safe_ratio(
+        chartex_row["ALBUM_TT_VIDEOS_LAST_7D"], safe_total_videos
+    )
+    engineered["TT_TERMINAL_ACCELERATION"] = _safe_ratio(
+        chartex_row["ALBUM_TT_VIDEOS_LAST_24H"], safe_total_videos
+    )
+    engineered["TT_ENGAGEMENT_DEPTH"] = _safe_ratio(
+        chartex_row["ALBUM_TOTAL_TT_SAVES"] + chartex_row["ALBUM_TOTAL_TT_SHARES"],
+        safe_total_views,
+    )
+    engineered["TT_LIKE_RATIO"] = _safe_ratio(
+        chartex_row["ALBUM_TOTAL_TT_LIKES"], safe_total_views
+    )
+    return engineered
+
+
+def fetch_live_snowflake_metrics(artist_id: str, anchor_date: str) -> dict[str, Any]:
+    """Pull live catalog velocity and Chartex TikTok aggregates anchored to a release date."""
     connection = get_snowflake_connection()
     try:
         cursor = connection.cursor()
-        cursor.execute(LIVE_CATALOG_SQL, {"artist_id": artist_id})
-        rows = cursor.fetchall()
-        columns = [col[0] for col in cursor.description]
+        cursor.execute(
+            LIVE_CATALOG_SQL,
+            {"artist_id": artist_id, "anchor_date": anchor_date},
+        )
+        catalog_rows = cursor.fetchall()
+        catalog_columns = [col[0] for col in cursor.description]
+
+        cursor.execute(
+            LIVE_CHARTEX_SQL,
+            {"artist_id": artist_id, "anchor_date": anchor_date},
+        )
+        chartex_rows = cursor.fetchall()
+        chartex_columns = [col[0] for col in cursor.description]
     finally:
         connection.close()
 
-    if not rows:
+    if not catalog_rows:
         raise ValueError(
             f"No catalog stream rows returned from Snowflake for ARTIST_ID={artist_id}"
         )
 
-    weekly_catalog = pd.DataFrame(rows, columns=columns)
+    weekly_catalog = pd.DataFrame(catalog_rows, columns=catalog_columns)
     weekly_catalog.columns = weekly_catalog.columns.str.upper()
     weekly_catalog["WEEKS_PRIOR_TO_RELEASE"] = weekly_catalog["WEEKS_PRIOR_TO_RELEASE"].astype(
         int
@@ -325,7 +447,31 @@ def fetch_live_catalog_metrics(artist_id: str) -> tuple[float, float]:
 
     catalog_velocity_slope = compute_catalog_velocity_slope(weekly_catalog)
     short_term_spike_ratio = compute_short_term_spike_ratio(weekly_catalog)
-    return catalog_velocity_slope, short_term_spike_ratio
+
+    chartex_row: pd.Series | None = None
+    if chartex_rows:
+        chartex_df = pd.DataFrame(chartex_rows, columns=chartex_columns)
+        chartex_df.columns = chartex_df.columns.str.upper()
+        chartex_row = chartex_df.iloc[0]
+
+    raw_chartex: dict[str, float] = {col: np.nan for col in CHARTEX_RAW_COLUMNS}
+    if not _chartex_row_is_empty(chartex_row):
+        assert chartex_row is not None
+        for col in CHARTEX_RAW_COLUMNS:
+            value = chartex_row.get(col, np.nan)
+            raw_chartex[col] = np.nan if pd.isna(value) else float(value)
+
+    engineered_chartex = engineer_live_chartex_features(
+        chartex_row if chartex_row is not None else pd.Series(dtype=float)
+    )
+
+    return {
+        "anchor_date": anchor_date,
+        "catalog_velocity_slope": catalog_velocity_slope,
+        "short_term_spike_ratio": short_term_spike_ratio,
+        **raw_chartex,
+        **engineered_chartex,
+    }
 
 
 def format_streams(value: float) -> str:
@@ -510,6 +656,31 @@ def run_sandbox_mode(
 def load_model_metadata(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_stage4_payload() -> dict[str, Any] | None:
+    """Load Stage 4 Chartex multiplier artifacts when exported."""
+    if not CHARTEX_MULTIPLIER_PATH.exists():
+        return None
+    return joblib.load(CHARTEX_MULTIPLIER_PATH)
+
+
+def apply_stage4_multiplier(
+    primary_spb: float,
+    synthetic_row: pd.Series,
+    stage4_payload: dict[str, Any],
+) -> tuple[float, float]:
+    """Exponentiate the log-multiplier prediction and cascade onto primary SPB."""
+    chartex_features: list[str] = stage4_payload["chartex_features"]
+    stage4_model: LGBMRegressor = stage4_payload["regressor"]
+    multiplier_min = float(stage4_payload.get("multiplier_min", 0.1))
+    multiplier_max = float(stage4_payload.get("multiplier_max", 100.0))
+
+    X_stage4 = pd.DataFrame([synthetic_row[chartex_features].to_dict()])
+    predicted_log_multiplier = float(stage4_model.predict(X_stage4)[0])
+    viral_multiplier = float(np.clip(np.exp(predicted_log_multiplier), multiplier_min, multiplier_max))
+    final_spb = primary_spb * viral_multiplier
+    return final_spb, viral_multiplier
 
 
 def load_regressor_payload(path: Path) -> LGBMRegressor:
@@ -721,8 +892,7 @@ def build_single_shot_df(
     lead_volume: float,
     active_singles: int,
     retention: float,
-    catalog_velocity_slope: float | None = None,
-    short_term_spike_ratio: float | None = None,
+    live_metrics: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Hydrate historical features for an artist and inject hypothetical rollout data."""
     if not FEATURE_MATRIX_PATH.exists():
@@ -761,10 +931,18 @@ def build_single_shot_df(
     base_row["RETENTION_RATIO"] = retention if lead_volume > 0 else np.nan
     base_row["IS_DEBUT_ALBUM"] = is_debut
 
-    if catalog_velocity_slope is not None:
-        base_row["CATALOG_VELOCITY_SLOPE"] = catalog_velocity_slope
-    if short_term_spike_ratio is not None:
-        base_row["SHORT_TERM_SPIKE_RATIO"] = short_term_spike_ratio
+    for col in [*CHARTEX_RAW_COLUMNS, *CHARTEX_ENGINEERED_COLUMNS]:
+        base_row[col] = np.nan
+
+    if live_metrics:
+        if "catalog_velocity_slope" in live_metrics:
+            base_row["CATALOG_VELOCITY_SLOPE"] = live_metrics["catalog_velocity_slope"]
+        if "short_term_spike_ratio" in live_metrics:
+            base_row["SHORT_TERM_SPIKE_RATIO"] = live_metrics["short_term_spike_ratio"]
+
+        for col in [*CHARTEX_RAW_COLUMNS, *CHARTEX_ENGINEERED_COLUMNS]:
+            value = live_metrics.get(col, np.nan)
+            base_row[col] = np.nan if value is None or pd.isna(value) else value
 
     velocity = float(base_row.get("CATALOG_VELOCITY_SLOPE", 0.0))
     if pd.isna(velocity):
@@ -772,6 +950,124 @@ def build_single_shot_df(
     base_row["VELOCITY_X_SINGLES"] = velocity * active_singles
 
     return prepare_rollout_features(pd.DataFrame([base_row]))
+
+
+def print_single_shot_report(
+    artist: str,
+    row: pd.Series,
+    probability: float,
+    prediction_stage: str,
+    primary_spb: float,
+    final_spb: float,
+    final_streams: float,
+    viral_multiplier: float | None,
+    current_market_size: int,
+) -> None:
+    """Print a single-artist ML forecast with optional Stage 4 cascade details."""
+    stage_label = STAGE_DISPLAY_LABELS.get(prediction_stage, prediction_stage)
+    active_singles = row.get("ACTIVE_SINGLE_COUNT", np.nan)
+    lead_peak = row.get("LEAD_SINGLE_PEAK_VOLUME", np.nan)
+    retention = row.get("RETENTION_RATIO", np.nan)
+
+    print("\n" + "=" * 72)
+    print("ML SINGLE-SHOT INFERENCE — WEEK 1 ALBUM STREAM FORECAST")
+    print("=" * 72)
+    print(f"Artist:                  {artist}")
+    print(f"Current Market Size:     {current_market_size:,} streams")
+    print("-" * 72)
+    print(f"  Active Singles:        {int(active_singles) if pd.notna(active_singles) else 'N/A'}")
+    print(
+        f"  Lead Single W1 Volume: {format_streams(float(lead_peak)) if pd.notna(lead_peak) else 'N/A'}"
+    )
+    print(f"  Retention Ratio:       {format_percent(float(retention)) if pd.notna(retention) else 'N/A'}")
+    print(f"  Gatekeeper Prob:       {probability:.1%}")
+    print(f"  Prediction Stage:      {stage_label}")
+    if not np.isnan(primary_spb):
+        print(f"  Primary Predicted SPB: {format_spb(primary_spb)}")
+    if viral_multiplier is not None:
+        print(
+            f"  [Cascaded Stage 4 Multiplier Applied: {viral_multiplier:.2f}x]"
+        )
+    if not np.isnan(final_spb):
+        print(f"  Final Predicted SPB:   {format_spb(final_spb)}")
+    print(f"  WEEK 1 FORECAST:       {format_streams(final_streams)} streams")
+    print("=" * 72 + "\n")
+
+
+def run_single_shot_inference(
+    synthetic_df: pd.DataFrame,
+    artist: str,
+    current_market_size: int,
+    stage4_payload: dict[str, Any] | None = None,
+) -> None:
+    """Score one synthetic rollout row, optionally cascading Stage 4 Chartex multiplier."""
+    peer_benchmarks = load_peer_benchmarks()
+    classifier, regressor, superstar_regressor, metadata = load_ml_artifacts()
+
+    feature_columns: list[str] = metadata.get("feature_columns", FEATURE_COLUMNS)
+    stage3_feature_columns: list[str] = metadata.get(
+        "stage3_feature_columns", STAGE3_FEATURE_COLUMNS
+    )
+
+    prepared_df = prepare_rollout_features(synthetic_df)
+    missing_features = [
+        col
+        for col in [*feature_columns, *stage3_feature_columns, "GENRE", "LEVEL_2_DISTRIBUTOR"]
+        if col not in prepared_df.columns
+    ]
+    if missing_features:
+        print(
+            f"Error: rollout data is missing required feature columns: {missing_features}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    features = sanitize_features(prepared_df, feature_columns)
+    probabilities = gatekeeper_predict_proba(classifier, features)
+
+    predicted_spb, prediction_stages = predict_pipeline(
+        X_input=prepared_df,
+        X_stage3=prepared_df,
+        classifier=classifier,
+        regressor_stage2=regressor,
+        regressor_stage3=superstar_regressor,
+        gatekeeper_threshold=metadata["optimal_prod_threshold"],
+        superstar_threshold=metadata["superstar_threshold"],
+        superstar_router_ratio=metadata["superstar_router_ratio"],
+    )
+
+    row = prepared_df.iloc[0]
+    stage = str(prediction_stages[0])
+    probability = float(probabilities[0])
+    primary_spb = float(predicted_spb[0]) if not np.isnan(predicted_spb[0]) else np.nan
+    viral_multiplier: float | None = None
+    final_spb = primary_spb
+
+    if stage == STAGE_LABEL_GATEKEEPER or np.isnan(primary_spb):
+        final_streams = standard_release_fallback(row, current_market_size, peer_benchmarks)
+        final_spb = np.nan
+    else:
+        if stage4_payload is not None:
+            final_spb, viral_multiplier = apply_stage4_multiplier(
+                primary_spb, row, stage4_payload
+            )
+
+        final_streams = max(
+            decode_spb_to_streams(float(final_spb), current_market_size),
+            RAW_STREAM_FLOOR,
+        )
+
+    print_single_shot_report(
+        artist=artist,
+        row=row,
+        probability=probability,
+        prediction_stage=stage,
+        primary_spb=primary_spb,
+        final_spb=float(final_spb) if not np.isnan(final_spb) else np.nan,
+        final_streams=final_streams,
+        viral_multiplier=viral_multiplier,
+        current_market_size=current_market_size,
+    )
 
 
 def run_ml_mode(rollout_df: pd.DataFrame, current_market_size: int) -> None:
@@ -864,22 +1160,34 @@ def main() -> None:
             )
             sys.exit(1)
 
-        catalog_velocity_slope: float | None = None
-        short_term_spike_ratio: float | None = None
-        if args.artist_id:
+        if args.first_sale_date:
             try:
-                catalog_velocity_slope, short_term_spike_ratio = fetch_live_catalog_metrics(
-                    args.artist_id
+                datetime.strptime(args.first_sale_date, "%Y-%m-%d")
+            except ValueError:
+                print(
+                    "Error: --first-sale-date must be formatted as YYYY-MM-DD.",
+                    file=sys.stderr,
                 )
-            except (EnvironmentError, ImportError, ValueError) as exc:
-                print(f"Error: Failed to fetch live catalog metrics: {exc}", file=sys.stderr)
                 sys.exit(1)
 
-            print("\nLive Snowflake Catalog Metrics:")
+        anchor_date = resolve_anchor_date(args.first_sale_date)
+        live_metrics: dict[str, Any] | None = None
+        if args.artist_id:
+            try:
+                live_metrics = fetch_live_snowflake_metrics(args.artist_id, anchor_date)
+            except (EnvironmentError, ImportError, ValueError) as exc:
+                print(f"Error: Failed to fetch live Snowflake metrics: {exc}", file=sys.stderr)
+                sys.exit(1)
+
+            print("\nLive Snowflake Metrics:")
             print("-" * 72)
             print(f"  ARTIST_ID:                {args.artist_id}")
-            print(f"  CATALOG_VELOCITY_SLOPE:   {catalog_velocity_slope:,.2f}")
-            print(f"  SHORT_TERM_SPIKE_RATIO:   {short_term_spike_ratio:.4f}")
+            print(f"  Anchor Date:              {anchor_date}")
+            print(f"  CATALOG_VELOCITY_SLOPE:   {live_metrics['catalog_velocity_slope']:,.2f}")
+            print(f"  SHORT_TERM_SPIKE_RATIO:   {live_metrics['short_term_spike_ratio']:.4f}")
+            for col in CHARTEX_RAW_COLUMNS:
+                value = live_metrics.get(col, np.nan)
+                print(f"  {col}: {value if pd.isna(value) else f'{value:,.0f}'}")
 
         synthetic_df = build_single_shot_df(
             artist=args.artist,
@@ -887,8 +1195,7 @@ def main() -> None:
             lead_volume=args.lead_single_volume,
             active_singles=args.active_singles,
             retention=args.retention_ratio,
-            catalog_velocity_slope=catalog_velocity_slope,
-            short_term_spike_ratio=short_term_spike_ratio,
+            live_metrics=live_metrics,
         )
 
         print("\nGenerated Synthetic Rollout Features:")
@@ -898,10 +1205,17 @@ def main() -> None:
             "CATALOG_VELOCITY_SLOPE",
             "VELOCITY_X_SINGLES",
             "SHORT_TERM_SPIKE_RATIO",
+            *CHARTEX_ENGINEERED_COLUMNS,
         ]:
             print(f"  {col}: {synthetic_df.iloc[0].get(col, 'N/A')}")
 
-        run_ml_mode(synthetic_df, args.current_market_size)
+        stage4_payload = load_stage4_payload()
+        run_single_shot_inference(
+            synthetic_df,
+            artist=args.artist,
+            current_market_size=args.current_market_size,
+            stage4_payload=stage4_payload,
+        )
         return
 
     if args.input_file is None:
