@@ -1,6 +1,11 @@
 """DAP pre-release social feature schema and engineering for Stage 4.
 
 Source table: US_LABELS_SANDBOX.RONAN_N.DAP_SOCIAL_PRE_RELEASE
+
+Live / rebuild stitch (SSO profile required):
+- Artist map: DF_PROD.DAP.DIM_ARTIST
+- TikTok facts: DF_PROD_DAP_MISC.DAP.FACT_SOCIAL (platform_key 2041)
+- YouTube facts: DF_PROD.DAP.FACT_SOCIAL (platform_keys 2000, 193)
 """
 
 from __future__ import annotations
@@ -64,12 +69,249 @@ SOCIAL_FEATURES = DAP_SOCIAL_ENGINEERED_COLUMNS + [
     "YT_TOTAL_COMMENTS",
 ]
 
-LIVE_DAP_SOCIAL_SQL = f"""
+LIVE_DAP_SOCIAL_SQL = """
+WITH resolved_artist AS (
+    SELECT artist_id
+    FROM US_LABELS_SANDBOX.RONAN_N.ARTIST_ALBUM_STREAM_AVGS
+    WHERE mrelg_id = %(mrelg_id)s
+    LIMIT 1
+),
+target_album AS (
+    SELECT
+        COALESCE(%(artist_id)s, (SELECT artist_id FROM resolved_artist)) AS artist_id,
+        %(mrelg_id)s AS mrelg_id,
+        %(anchor_date)s::DATE AS cutoff_date
+),
+-- Full artist_key map lives on DF_PROD (MISC.DIM_ARTIST is nearly empty).
+artist_mapping AS (
+    SELECT DISTINCT
+        am.luminate_artist_id AS artist_id,
+        da.artist_key
+    FROM CURRENT_DEV.DATA.ARTIST_METADATA am
+    JOIN DF_PROD.DAP.DIM_ARTIST da
+        ON da.spotify_id = am.spotify_sys_id
+    JOIN target_album ta
+        ON am.luminate_artist_id = ta.artist_id
+    WHERE am.luminate_artist_id IS NOT NULL
+),
+-- Stitch: TikTok from DF_PROD_DAP_MISC, YouTube from DF_PROD.
+fact_social_stitched AS (
+    SELECT
+        fs.artist_key,
+        fs.date_key,
+        fs.view_cnt,
+        fs.like_cnt,
+        fs.share_cnt,
+        fs.comment_cnt,
+        'TikTok' AS platform_name
+    FROM DF_PROD_DAP_MISC.DAP.FACT_SOCIAL fs
+    WHERE fs.platform_key = '2041'
+
+    UNION ALL
+
+    SELECT
+        fs.artist_key,
+        fs.date_key,
+        fs.view_cnt,
+        fs.like_cnt,
+        fs.share_cnt,
+        fs.comment_cnt,
+        'YouTube' AS platform_name
+    FROM DF_PROD.DAP.FACT_SOCIAL fs
+    WHERE fs.platform_key IN ('2000', '193')
+),
+social_daily_ranked AS (
+    SELECT
+        ta.mrelg_id,
+        ta.cutoff_date AS first_sale_date,
+        fs.platform_name,
+        fs.date_key,
+        fs.view_cnt,
+        fs.like_cnt,
+        fs.share_cnt,
+        fs.comment_cnt,
+        ROW_NUMBER() OVER (
+            PARTITION BY ta.mrelg_id, fs.platform_name
+            ORDER BY fs.date_key DESC
+        ) AS rn
+    FROM target_album ta
+    JOIN artist_mapping map
+        ON map.artist_id = ta.artist_id
+    JOIN fact_social_stitched fs
+        ON fs.artist_key = map.artist_key
+    WHERE fs.date_key <= ta.cutoff_date
+),
+platform_aggregates AS (
+    SELECT
+        mrelg_id,
+        platform_name,
+        MAX(first_sale_date) AS first_sale_date,
+        SUM(view_cnt) AS total_views,
+        SUM(like_cnt) AS total_likes,
+        SUM(share_cnt) AS total_shares,
+        SUM(comment_cnt) AS total_comments,
+        SUM(IFF(rn <= 7, view_cnt, 0)) AS views_7d,
+        SUM(IFF(rn <= 7, like_cnt, 0)) AS likes_7d,
+        SUM(IFF(rn <= 7, share_cnt, 0)) AS shares_7d,
+        SUM(IFF(rn <= 7, comment_cnt, 0)) AS comments_7d,
+        SUM(IFF(rn = 1, view_cnt, 0)) AS views_24h,
+        SUM(IFF(rn = 1, like_cnt, 0)) AS likes_24h,
+        SUM(IFF(rn = 1, share_cnt, 0)) AS shares_24h,
+        SUM(IFF(rn = 1, comment_cnt, 0)) AS comments_24h
+    FROM social_daily_ranked
+    GROUP BY mrelg_id, platform_name
+)
 SELECT
-    {", ".join(DAP_SOCIAL_FETCH_COLUMNS)}
-FROM {DAP_SOCIAL_SOURCE_TABLE}
-WHERE MRELG_ID = %(mrelg_id)s
-LIMIT 1
+    mrelg_id AS MRELG_ID,
+    MIN(first_sale_date) AS FIRST_SALE_DATE,
+    SUM(IFF(platform_name = 'TikTok', total_views, 0)) AS TT_TOTAL_VIEWS,
+    SUM(IFF(platform_name = 'TikTok', total_likes, 0)) AS TT_TOTAL_LIKES,
+    SUM(IFF(platform_name = 'TikTok', total_shares, 0)) AS TT_TOTAL_SHARES,
+    SUM(IFF(platform_name = 'TikTok', total_comments, 0)) AS TT_TOTAL_COMMENTS,
+    SUM(IFF(platform_name = 'TikTok', views_7d, 0)) AS TT_VIEWS_LAST_7D,
+    SUM(IFF(platform_name = 'TikTok', likes_7d, 0)) AS TT_LIKES_LAST_7D,
+    SUM(IFF(platform_name = 'TikTok', shares_7d, 0)) AS TT_SHARES_LAST_7D,
+    SUM(IFF(platform_name = 'TikTok', comments_7d, 0)) AS TT_COMMENTS_LAST_7D,
+    SUM(IFF(platform_name = 'TikTok', views_24h, 0)) AS TT_VIEWS_LAST_24H,
+    SUM(IFF(platform_name = 'TikTok', likes_24h, 0)) AS TT_LIKES_LAST_24H,
+    SUM(IFF(platform_name = 'TikTok', shares_24h, 0)) AS TT_SHARES_LAST_24H,
+    SUM(IFF(platform_name = 'TikTok', comments_24h, 0)) AS TT_COMMENTS_LAST_24H,
+    SUM(IFF(platform_name = 'YouTube', total_views, 0)) AS YT_TOTAL_VIEWS,
+    SUM(IFF(platform_name = 'YouTube', total_likes, 0)) AS YT_TOTAL_LIKES,
+    SUM(IFF(platform_name = 'YouTube', total_shares, 0)) AS YT_TOTAL_SHARES,
+    SUM(IFF(platform_name = 'YouTube', total_comments, 0)) AS YT_TOTAL_COMMENTS,
+    SUM(IFF(platform_name = 'YouTube', views_7d, 0)) AS YT_VIEWS_LAST_7D,
+    SUM(IFF(platform_name = 'YouTube', likes_7d, 0)) AS YT_LIKES_LAST_7D,
+    SUM(IFF(platform_name = 'YouTube', shares_7d, 0)) AS YT_SHARES_LAST_7D,
+    SUM(IFF(platform_name = 'YouTube', comments_7d, 0)) AS YT_COMMENTS_LAST_7D,
+    SUM(IFF(platform_name = 'YouTube', views_24h, 0)) AS YT_VIEWS_LAST_24H,
+    SUM(IFF(platform_name = 'YouTube', likes_24h, 0)) AS YT_LIKES_LAST_24H,
+    SUM(IFF(platform_name = 'YouTube', shares_24h, 0)) AS YT_SHARES_LAST_24H,
+    SUM(IFF(platform_name = 'YouTube', comments_24h, 0)) AS YT_COMMENTS_LAST_24H
+FROM platform_aggregates
+GROUP BY mrelg_id
+"""
+
+# Full-table rebuild used by fetch_dap_social_features.py.
+# Cutoff per album is LEAST(first_sale_date, CURRENT_DATE()) so future releases
+# only accumulate social mass through today.
+DAP_SOCIAL_REBUILD_SQL = """
+CREATE OR REPLACE TABLE US_LABELS_SANDBOX.RONAN_N.DAP_SOCIAL_PRE_RELEASE AS
+WITH target_albums AS (
+    SELECT
+        artist_id,
+        mrelg_id,
+        display_artist,
+        first_sale_date,
+        album_total_w1_streams,
+        LEAST(first_sale_date, CURRENT_DATE()) AS cutoff_date
+    FROM US_LABELS_SANDBOX.RONAN_N.ARTIST_ALBUM_STREAM_AVGS
+),
+artist_mapping AS (
+    SELECT DISTINCT
+        am.luminate_artist_id AS artist_id,
+        da.artist_key
+    FROM CURRENT_DEV.DATA.ARTIST_METADATA am
+    JOIN DF_PROD.DAP.DIM_ARTIST da
+        ON da.spotify_id = am.spotify_sys_id
+    WHERE am.luminate_artist_id IS NOT NULL
+),
+fact_social_stitched AS (
+    SELECT
+        fs.artist_key,
+        fs.date_key,
+        fs.view_cnt,
+        fs.like_cnt,
+        fs.share_cnt,
+        fs.comment_cnt,
+        'TikTok' AS platform_name
+    FROM DF_PROD_DAP_MISC.DAP.FACT_SOCIAL fs
+    WHERE fs.platform_key = '2041'
+
+    UNION ALL
+
+    SELECT
+        fs.artist_key,
+        fs.date_key,
+        fs.view_cnt,
+        fs.like_cnt,
+        fs.share_cnt,
+        fs.comment_cnt,
+        'YouTube' AS platform_name
+    FROM DF_PROD.DAP.FACT_SOCIAL fs
+    WHERE fs.platform_key IN ('2000', '193')
+),
+social_daily_ranked AS (
+    SELECT
+        ta.mrelg_id,
+        ta.first_sale_date,
+        fs.platform_name,
+        fs.date_key,
+        fs.view_cnt,
+        fs.like_cnt,
+        fs.share_cnt,
+        fs.comment_cnt,
+        ROW_NUMBER() OVER (
+            PARTITION BY ta.mrelg_id, fs.platform_name
+            ORDER BY fs.date_key DESC
+        ) AS rn
+    FROM target_albums ta
+    JOIN artist_mapping map
+        ON map.artist_id = ta.artist_id
+    JOIN fact_social_stitched fs
+        ON fs.artist_key = map.artist_key
+    WHERE fs.date_key <= ta.cutoff_date
+),
+platform_aggregates AS (
+    SELECT
+        mrelg_id,
+        platform_name,
+        MAX(first_sale_date) AS first_sale_date,
+        SUM(view_cnt) AS total_views,
+        SUM(like_cnt) AS total_likes,
+        SUM(share_cnt) AS total_shares,
+        SUM(comment_cnt) AS total_comments,
+        SUM(IFF(rn <= 7, view_cnt, 0)) AS views_7d,
+        SUM(IFF(rn <= 7, like_cnt, 0)) AS likes_7d,
+        SUM(IFF(rn <= 7, share_cnt, 0)) AS shares_7d,
+        SUM(IFF(rn <= 7, comment_cnt, 0)) AS comments_7d,
+        SUM(IFF(rn = 1, view_cnt, 0)) AS views_24h,
+        SUM(IFF(rn = 1, like_cnt, 0)) AS likes_24h,
+        SUM(IFF(rn = 1, share_cnt, 0)) AS shares_24h,
+        SUM(IFF(rn = 1, comment_cnt, 0)) AS comments_24h
+    FROM social_daily_ranked
+    GROUP BY mrelg_id, platform_name
+)
+SELECT
+    mrelg_id,
+    MIN(first_sale_date) AS first_sale_date,
+    SUM(IFF(platform_name = 'TikTok', total_views, 0)) AS tt_total_views,
+    SUM(IFF(platform_name = 'TikTok', total_likes, 0)) AS tt_total_likes,
+    SUM(IFF(platform_name = 'TikTok', total_shares, 0)) AS tt_total_shares,
+    SUM(IFF(platform_name = 'TikTok', total_comments, 0)) AS tt_total_comments,
+    SUM(IFF(platform_name = 'TikTok', views_7d, 0)) AS tt_views_last_7d,
+    SUM(IFF(platform_name = 'TikTok', likes_7d, 0)) AS tt_likes_last_7d,
+    SUM(IFF(platform_name = 'TikTok', shares_7d, 0)) AS tt_shares_last_7d,
+    SUM(IFF(platform_name = 'TikTok', comments_7d, 0)) AS tt_comments_last_7d,
+    SUM(IFF(platform_name = 'TikTok', views_24h, 0)) AS tt_views_last_24h,
+    SUM(IFF(platform_name = 'TikTok', likes_24h, 0)) AS tt_likes_last_24h,
+    SUM(IFF(platform_name = 'TikTok', shares_24h, 0)) AS tt_shares_last_24h,
+    SUM(IFF(platform_name = 'TikTok', comments_24h, 0)) AS tt_comments_last_24h,
+    SUM(IFF(platform_name = 'YouTube', total_views, 0)) AS yt_total_views,
+    SUM(IFF(platform_name = 'YouTube', total_likes, 0)) AS yt_total_likes,
+    SUM(IFF(platform_name = 'YouTube', total_shares, 0)) AS yt_total_shares,
+    SUM(IFF(platform_name = 'YouTube', total_comments, 0)) AS yt_total_comments,
+    SUM(IFF(platform_name = 'YouTube', views_7d, 0)) AS yt_views_last_7d,
+    SUM(IFF(platform_name = 'YouTube', likes_7d, 0)) AS yt_likes_last_7d,
+    SUM(IFF(platform_name = 'YouTube', shares_7d, 0)) AS yt_shares_last_7d,
+    SUM(IFF(platform_name = 'YouTube', comments_7d, 0)) AS yt_comments_last_7d,
+    SUM(IFF(platform_name = 'YouTube', views_24h, 0)) AS yt_views_last_24h,
+    SUM(IFF(platform_name = 'YouTube', likes_24h, 0)) AS yt_likes_last_24h,
+    SUM(IFF(platform_name = 'YouTube', shares_24h, 0)) AS yt_shares_last_24h,
+    SUM(IFF(platform_name = 'YouTube', comments_24h, 0)) AS yt_comments_last_24h
+FROM platform_aggregates
+GROUP BY mrelg_id
+ORDER BY first_sale_date DESC
 """
 
 # Real social presence: ignore tiny/noisy view counts.

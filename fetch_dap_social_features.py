@@ -1,9 +1,11 @@
-"""Fetch DAP pre-release social features from Snowflake for Stage 4 training.
+"""Fetch / rebuild DAP pre-release social features from Snowflake.
 
-Replaces the legacy Chartex extract (`data/chartex_velocity_training.csv`) with:
-  US_LABELS_SANDBOX.RONAN_N.DAP_SOCIAL_PRE_RELEASE
+Training extract destination: data/dap_social_pre_release.csv
+Source rebuild: US_LABELS_SANDBOX.RONAN_N.DAP_SOCIAL_PRE_RELEASE
 
-Auth: secrets/amg_research.env (SSO externalbrowser supported).
+Cutoff rule per album: LEAST(first_sale_date, CURRENT_DATE())
+  - past releases: social mass stops at release date
+  - future releases: social mass stops at today
 """
 
 from __future__ import annotations
@@ -13,13 +15,17 @@ from pathlib import Path
 
 import pandas as pd
 
-from dap_social_features import DAP_SOCIAL_FETCH_COLUMNS, DAP_SOCIAL_SOURCE_TABLE
-from snowflake_client import get_snowflake_connection
+from dap_social_features import (
+    DAP_SOCIAL_FETCH_COLUMNS,
+    DAP_SOCIAL_REBUILD_SQL,
+    DAP_SOCIAL_SOURCE_TABLE,
+)
+from snowflake_client import get_dap_snowflake_connection, get_snowflake_connection
 
 DATA_DIR = Path("data")
 DEFAULT_OUTPUT_PATH = DATA_DIR / "dap_social_pre_release.csv"
 
-FETCH_SQL = f"""
+SELECT_SQL = f"""
 SELECT
     {", ".join(DAP_SOCIAL_FETCH_COLUMNS)}
 FROM {DAP_SOCIAL_SOURCE_TABLE}
@@ -28,7 +34,18 @@ FROM {DAP_SOCIAL_SOURCE_TABLE}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Pull DAP_SOCIAL_PRE_RELEASE from Snowflake into a local CSV."
+        description=(
+            "Rebuild DAP_SOCIAL_PRE_RELEASE from FACT_SOCIAL (date-anchored) "
+            "and optionally export a local CSV."
+        )
+    )
+    parser.add_argument(
+        "--rebuild-table",
+        action="store_true",
+        help=(
+            "Run CREATE OR REPLACE on US_LABELS_SANDBOX.RONAN_N.DAP_SOCIAL_PRE_RELEASE "
+            "using LEAST(first_sale_date, CURRENT_DATE()) cutoffs."
+        ),
     )
     parser.add_argument(
         "--output-file",
@@ -36,16 +53,38 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_PATH,
         help=f"Destination CSV path (default: {DEFAULT_OUTPUT_PATH})",
     )
+    parser.add_argument(
+        "--skip-csv",
+        action="store_true",
+        help="Rebuild the Snowflake table only; do not write a local CSV.",
+    )
     return parser.parse_args()
 
 
+def rebuild_dap_social_table() -> None:
+    """Materialize the date-anchored DAP social training table in Snowflake.
+
+    Uses SSO via secrets/amg_research_password.env so both DF_PROD_DAP_MISC
+    (TikTok) and DF_PROD (YouTube + DIM_ARTIST) are reachable; the CREATE OR
+    REPLACE target remains the fully-qualified sandbox table.
+    """
+    connection = get_dap_snowflake_connection()
+    try:
+        cursor = connection.cursor()
+        print(f"Rebuilding {DAP_SOCIAL_SOURCE_TABLE} with proper date cutoffs ...")
+        cursor.execute(DAP_SOCIAL_REBUILD_SQL)
+        print("Rebuild complete.")
+    finally:
+        connection.close()
+
+
 def fetch_dap_social_pre_release() -> pd.DataFrame:
-    """Query the full DAP social pre-release table into a DataFrame."""
+    """Query the DAP social pre-release table into a DataFrame."""
     connection = get_snowflake_connection()
     try:
         cursor = connection.cursor()
         print(f"Querying {DAP_SOCIAL_SOURCE_TABLE} ...")
-        cursor.execute(FETCH_SQL)
+        cursor.execute(SELECT_SQL)
         rows = cursor.fetchall()
         columns = [col[0] for col in cursor.description]
     finally:
@@ -58,8 +97,14 @@ def fetch_dap_social_pre_release() -> pd.DataFrame:
 
 def main() -> None:
     args = parse_args()
-    df = fetch_dap_social_pre_release()
 
+    if args.rebuild_table:
+        rebuild_dap_social_table()
+
+    if args.skip_csv:
+        return
+
+    df = fetch_dap_social_pre_release()
     missing = [col for col in DAP_SOCIAL_FETCH_COLUMNS if col not in df.columns]
     if missing:
         raise ValueError(f"Fetched frame is missing expected columns: {missing}")

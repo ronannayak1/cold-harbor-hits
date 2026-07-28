@@ -1,4 +1,9 @@
-"""Shared Snowflake connection helper for Cold Harbor Hits."""
+"""Shared Snowflake connection helper for Cold Harbor Hits.
+
+Profiles:
+- secrets/amg_research.env           → APP_STAT key-pair (Luminate / sandbox)
+- secrets/amg_research_password.env  → SSO externalbrowser (DF_PROD_DAP_MISC)
+"""
 
 from __future__ import annotations
 
@@ -8,11 +13,13 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from dotenv import load_dotenv
+    from dotenv import dotenv_values, load_dotenv
 except ImportError:
+    dotenv_values = None
     load_dotenv = None
 
 SNOWFLAKE_ENV_PATH = Path("secrets/amg_research.env")
+SNOWFLAKE_DAP_ENV_PATH = Path("secrets/amg_research_password.env")
 SNOWFLAKE_BASE_ENV_VARS = (
     "SNOWFLAKE_USER",
     "SNOWFLAKE_ACCOUNT",
@@ -22,17 +29,40 @@ SNOWFLAKE_BASE_ENV_VARS = (
 
 
 def load_snowflake_env(env_path: Path = SNOWFLAKE_ENV_PATH) -> None:
-    """Load Snowflake credentials from secrets/amg_research.env."""
+    """Load a Snowflake profile into process env (override=True)."""
     if not env_path.exists():
         raise EnvironmentError(
             f"Snowflake env file not found: {env_path}. "
-            "Create secrets/amg_research.env with connection settings."
+            "Create the secrets profile with connection settings."
         )
     if load_dotenv is not None:
         load_dotenv(env_path, override=True)
 
 
-def _load_snowflake_private_key() -> bytes:
+def _profile_values(env_path: Path) -> dict[str, str]:
+    """Read a secrets profile without permanently mutating process env."""
+    if not env_path.exists():
+        raise EnvironmentError(
+            f"Snowflake env file not found: {env_path}. "
+            "Create the secrets profile with connection settings."
+        )
+    if dotenv_values is None:
+        load_snowflake_env(env_path)
+        return {key: value for key, value in os.environ.items() if key.startswith("SNOWFLAKE_")}
+
+    raw = dotenv_values(env_path)
+    return {
+        str(key): str(value)
+        for key, value in raw.items()
+        if key and value is not None and str(value) != ""
+    }
+
+
+def _has_private_key_config(profile: dict[str, str]) -> bool:
+    return bool(profile.get("SNOWFLAKE_PRIVATE_KEY_PATH") or profile.get("SNOWFLAKE_PRIVATE_KEY"))
+
+
+def _load_snowflake_private_key(profile: dict[str, str]) -> bytes:
     """Load a PKCS#8 private key for Snowflake key-pair authentication."""
     try:
         from cryptography.hazmat.backends import default_backend
@@ -43,12 +73,17 @@ def _load_snowflake_private_key() -> bytes:
             "Install with: pip install cryptography"
         ) from exc
 
-    key_path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
-    key_pem = os.getenv("SNOWFLAKE_PRIVATE_KEY")
-    passphrase = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
+    key_path = profile.get("SNOWFLAKE_PRIVATE_KEY_PATH")
+    key_pem = profile.get("SNOWFLAKE_PRIVATE_KEY")
+    passphrase = profile.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
 
     if key_path:
-        key_data = Path(key_path).expanduser().read_bytes()
+        resolved = Path(key_path).expanduser()
+        if not resolved.is_absolute():
+            resolved = Path.cwd() / resolved
+        if not resolved.exists():
+            raise EnvironmentError(f"Snowflake private key file not found: {resolved}")
+        key_data = resolved.read_bytes()
     elif key_pem:
         key_data = key_pem.replace("\\n", "\n").encode()
     else:
@@ -69,12 +104,12 @@ def _load_snowflake_private_key() -> bytes:
 
 
 def get_snowflake_connection(env_path: Path = SNOWFLAKE_ENV_PATH):
-    """Open a Snowflake connection using secrets/amg_research.env credentials.
+    """Open a Snowflake connection from a secrets profile.
 
     Auth resolution order:
-    1. SNOWFLAKE_AUTHENTICATOR=externalbrowser (SSO)
-    2. SNOWFLAKE_AUTH_METHOD=key_pair
-    3. password (SNOWFLAKE_PASSWORD)
+    1. SNOWFLAKE_AUTHENTICATOR / AUTH_METHOD = externalbrowser (SSO)
+    2. Key-pair when AUTH_METHOD=key_pair or a private key is configured
+    3. Password (SNOWFLAKE_PASSWORD)
     """
     try:
         import snowflake.connector
@@ -85,41 +120,47 @@ def get_snowflake_connection(env_path: Path = SNOWFLAKE_ENV_PATH):
             f"(current interpreter: {sys.executable})"
         ) from exc
 
-    load_snowflake_env(env_path)
-    missing = [var for var in SNOWFLAKE_BASE_ENV_VARS if not os.getenv(var)]
+    profile = _profile_values(env_path)
+    missing = [var for var in SNOWFLAKE_BASE_ENV_VARS if not profile.get(var)]
     if missing:
         raise EnvironmentError(
-            f"Missing Snowflake environment variables: {', '.join(missing)}"
+            f"Missing Snowflake environment variables in {env_path}: {', '.join(missing)}"
         )
 
     connect_kwargs: dict[str, Any] = {
-        "user": os.environ["SNOWFLAKE_USER"],
-        "account": os.environ["SNOWFLAKE_ACCOUNT"],
-        "warehouse": os.environ["SNOWFLAKE_WAREHOUSE"],
-        "role": os.environ["SNOWFLAKE_ROLE"],
+        "user": profile["SNOWFLAKE_USER"],
+        "account": profile["SNOWFLAKE_ACCOUNT"],
+        "warehouse": profile["SNOWFLAKE_WAREHOUSE"],
+        "role": profile["SNOWFLAKE_ROLE"],
     }
 
-    database = os.getenv("SNOWFLAKE_DATABASE")
-    schema = os.getenv("SNOWFLAKE_SCHEMA")
+    database = profile.get("SNOWFLAKE_DATABASE")
+    schema = profile.get("SNOWFLAKE_SCHEMA")
     if database:
         connect_kwargs["database"] = database
     if schema:
         connect_kwargs["schema"] = schema
 
-    authenticator = os.getenv("SNOWFLAKE_AUTHENTICATOR", "").strip().lower()
-    auth_method = os.getenv("SNOWFLAKE_AUTH_METHOD", "password").strip().lower()
+    authenticator = profile.get("SNOWFLAKE_AUTHENTICATOR", "").strip().lower()
+    auth_method = profile.get("SNOWFLAKE_AUTH_METHOD", "").strip().lower()
 
     if authenticator == "externalbrowser" or auth_method == "externalbrowser":
         connect_kwargs["authenticator"] = "externalbrowser"
-    elif auth_method == "key_pair":
-        connect_kwargs["private_key"] = _load_snowflake_private_key()
+    elif auth_method == "key_pair" or _has_private_key_config(profile):
+        connect_kwargs["private_key"] = _load_snowflake_private_key(profile)
     else:
-        password = os.getenv("SNOWFLAKE_PASSWORD")
+        password = profile.get("SNOWFLAKE_PASSWORD")
         if not password:
             raise EnvironmentError(
-                "Password auth requires SNOWFLAKE_PASSWORD, or set "
-                "SNOWFLAKE_AUTHENTICATOR=externalbrowser / SNOWFLAKE_AUTH_METHOD=key_pair."
+                "Set SNOWFLAKE_AUTHENTICATOR=externalbrowser, "
+                "SNOWFLAKE_AUTH_METHOD=key_pair with a private key, "
+                "or SNOWFLAKE_PASSWORD."
             )
         connect_kwargs["password"] = password
 
     return snowflake.connector.connect(**connect_kwargs)
+
+
+def get_dap_snowflake_connection():
+    """SSO connection for stitched DAP social (MISC TikTok + PROD YouTube)."""
+    return get_snowflake_connection(SNOWFLAKE_DAP_ENV_PATH)

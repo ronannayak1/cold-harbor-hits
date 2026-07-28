@@ -27,7 +27,8 @@ from dap_social_features import (
     is_viral_social_candidate,
     should_apply_stage4,
 )
-from snowflake_client import get_snowflake_connection
+from lead_single_features import fetch_live_lead_singles
+from snowflake_client import get_dap_snowflake_connection, get_snowflake_connection
 from train_streaming_hurdle import (
     FEATURE_COLUMNS,
     STAGE3_FEATURE_COLUMNS,
@@ -139,8 +140,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "Target release date (YYYY-MM-DD). Data extraction anchors to the earlier "
-            "of this date and today."
+            "Target release date (YYYY-MM-DD). Required for --ml-single-shot. "
+            "Live catalog/DAP extraction anchors to min(this date, today)."
         ),
     )
     parser.add_argument(
@@ -158,20 +159,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lead-single-volume",
         type=float,
-        default=0.0,
-        help="Hypothetical lead single W1 volume for ML single-shot mode",
+        default=None,
+        help=(
+            "Lead single W1 volume for ML single-shot. "
+            "If omitted with --artist-id + --first-sale-date, pulled live "
+            "from Luminate (6-month pre-release window)."
+        ),
     )
     parser.add_argument(
         "--active-singles",
         type=int,
-        default=0,
-        help="Count of active pre-release singles for ML single-shot mode",
+        default=None,
+        help=(
+            "Active pre-release single count for ML single-shot. "
+            "If omitted with --artist-id + --first-sale-date, pulled live."
+        ),
     )
     parser.add_argument(
         "--retention-ratio",
         type=float,
-        default=0.5,
-        help="W2/W1 retention ratio for ML single-shot mode",
+        default=None,
+        help=(
+            "W2/W1 retention ratio for ML single-shot. "
+            "If omitted with --artist-id + --first-sale-date, pulled live."
+        ),
     )
     parser.add_argument(
         "--input-file",
@@ -268,12 +279,27 @@ def fetch_live_catalog_metrics(artist_id: str, anchor_date: str) -> dict[str, fl
     }
 
 
-def fetch_live_dap_social_metrics(mrelg_id: str) -> dict[str, float]:
-    """Pull DAP TT/YT pre-release social aggregates for one album."""
-    connection = get_snowflake_connection()
+def fetch_live_dap_social_metrics(
+    mrelg_id: str,
+    anchor_date: str,
+    artist_id: str | None = None,
+) -> dict[str, float]:
+    """Rebuild DAP TT/YT aggregates live from FACT_SOCIAL through the anchor date.
+
+    Anchor semantics match catalog velocity: include social days with
+    date_key <= min(release_date, today).
+    """
+    connection = get_dap_snowflake_connection()
     try:
         cursor = connection.cursor()
-        cursor.execute(LIVE_DAP_SOCIAL_SQL, {"mrelg_id": mrelg_id})
+        cursor.execute(
+            LIVE_DAP_SOCIAL_SQL,
+            {
+                "mrelg_id": mrelg_id,
+                "artist_id": artist_id,
+                "anchor_date": anchor_date,
+            },
+        )
         social_rows = cursor.fetchall()
         social_columns = [col[0] for col in cursor.description]
     finally:
@@ -300,14 +326,20 @@ def fetch_live_snowflake_metrics(
     anchor_date: str,
     mrelg_id: str | None = None,
 ) -> dict[str, Any]:
-    """Pull live catalog velocity and/or DAP social features from Snowflake."""
+    """Pull live catalog velocity and DAP social features, both cutoff at anchor_date."""
     metrics: dict[str, Any] = {"anchor_date": anchor_date}
 
     if artist_id:
         metrics.update(fetch_live_catalog_metrics(artist_id, anchor_date))
 
     if mrelg_id:
-        metrics.update(fetch_live_dap_social_metrics(mrelg_id))
+        metrics.update(
+            fetch_live_dap_social_metrics(
+                mrelg_id=mrelg_id,
+                anchor_date=anchor_date,
+                artist_id=artist_id,
+            )
+        )
     else:
         metrics.update({col: np.nan for col in DAP_SOCIAL_RAW_COLUMNS})
         metrics.update({col: np.nan for col in DAP_SOCIAL_ENGINEERED_COLUMNS})
@@ -1051,9 +1083,17 @@ def main() -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
+        elif args.artist_id or args.mrelg_id:
+            print(
+                "Warning: --first-sale-date not provided; anchoring live catalog/DAP "
+                "pulls to today. Pass --first-sale-date for release-as-of semantics.",
+                file=sys.stderr,
+            )
 
         anchor_date = resolve_anchor_date(args.first_sale_date)
+        release_date = args.first_sale_date or anchor_date
         live_metrics: dict[str, Any] | None = None
+        lead_metrics: dict[str, Any] | None = None
 
         # Prefer explicit --mrelg-id; otherwise hydrate history first to discover one.
         historical_mrelg_id: str | None = None
@@ -1086,7 +1126,8 @@ def main() -> None:
                 print(f"  ARTIST_ID:                {args.artist_id}")
             if resolved_mrelg_id:
                 print(f"  MRELG_ID:                 {resolved_mrelg_id}")
-            print(f"  Anchor Date:              {anchor_date}")
+            print(f"  Release Date:             {release_date}")
+            print(f"  Anchor Date (cutoff):     {anchor_date}  [= min(release, today)]")
             if live_metrics.get("catalog_velocity_slope") is not None and not pd.isna(
                 live_metrics.get("catalog_velocity_slope", np.nan)
             ):
@@ -1102,13 +1143,71 @@ def main() -> None:
             ]:
                 value = live_metrics.get(col, np.nan)
                 print(f"  {col}: {value if pd.isna(value) else f'{value:,.0f}'}")
+        else:
+            print(
+                "\nNote: pass --artist-id and/or --mrelg-id (with --first-sale-date) "
+                "to pull live catalog velocity and DAP social as-of the release cutoff."
+            )
+
+        if args.artist_id and args.first_sale_date:
+            try:
+                lead_metrics = fetch_live_lead_singles(
+                    artist_id=args.artist_id,
+                    release_date=release_date,
+                    anchor_date=anchor_date,
+                )
+            except (EnvironmentError, ImportError, ValueError) as exc:
+                print(f"Error: Failed to fetch live lead singles: {exc}", file=sys.stderr)
+                sys.exit(1)
+
+            print("\nLive Lead Singles (6-month window before release):")
+            print("-" * 72)
+            print(f"  ACTIVE_SINGLE_COUNT:      {lead_metrics['ACTIVE_SINGLE_COUNT']}")
+            print(
+                f"  LEAD_SINGLE_PEAK_VOLUME:  "
+                f"{lead_metrics['LEAD_SINGLE_PEAK_VOLUME']:,.0f}"
+            )
+            retention = lead_metrics["RETENTION_RATIO"]
+            print(
+                "  RETENTION_RATIO:          "
+                f"{'N/A' if pd.isna(retention) else f'{retention:.4f}'}"
+            )
+            for single in lead_metrics.get("lead_singles", []):
+                print(
+                    f"    - {single['first_sale_date']}  {single['title'][:40]:<40}  "
+                    f"W1={single['w1']:,.0f}  W2={single['w2']:,.0f}"
+                )
+        elif args.lead_single_volume is None:
+            print(
+                "\nNote: pass --artist-id and --first-sale-date to auto-pull lead "
+                "singles, or set --lead-single-volume / --active-singles / "
+                "--retention-ratio manually."
+            )
+
+        lead_volume = (
+            float(args.lead_single_volume)
+            if args.lead_single_volume is not None
+            else float(lead_metrics["LEAD_SINGLE_PEAK_VOLUME"] if lead_metrics else 0.0)
+        )
+        active_singles = (
+            int(args.active_singles)
+            if args.active_singles is not None
+            else int(lead_metrics["ACTIVE_SINGLE_COUNT"] if lead_metrics else 0)
+        )
+        if args.retention_ratio is not None:
+            retention = float(args.retention_ratio)
+        elif lead_metrics is not None:
+            retention_value = lead_metrics["RETENTION_RATIO"]
+            retention = float(retention_value) if not pd.isna(retention_value) else 0.5
+        else:
+            retention = 0.5
 
         synthetic_df = build_single_shot_df(
             artist=args.artist,
             tracks=args.tracks,
-            lead_volume=args.lead_single_volume,
-            active_singles=args.active_singles,
-            retention=args.retention_ratio,
+            lead_volume=lead_volume,
+            active_singles=active_singles,
+            retention=retention,
             live_metrics=live_metrics,
         )
 
