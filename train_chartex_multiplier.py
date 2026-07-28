@@ -1,4 +1,4 @@
-"""Train Stage 4 Chartex viral multiplier (delta residual) on top of the hurdle pipeline."""
+"""Train Stage 4 DAP social viral multiplier (delta residual) on top of the hurdle pipeline."""
 
 from __future__ import annotations
 
@@ -13,10 +13,22 @@ from lightgbm import LGBMClassifier, LGBMRegressor
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import GroupShuffleSplit
 
+from dap_social_features import (
+    DAP_SOCIAL_ENGINEERED_COLUMNS,
+    DAP_SOCIAL_RAW_COLUMNS,
+    REAL_SOCIAL_MIN_VIEWS,
+    SOCIAL_FEATURES,
+    VIRAL_TERMINAL_ACCELERATION_THRESHOLD,
+    annotate_social_gates,
+    assess_stage4_multiplier_health,
+    engineer_dap_social_features,
+)
 from train_streaming_hurdle import (
     FEATURE_COLUMNS,
     GROUP_COLUMN,
-    STAGE3_FEATURE_COLUMNS,
+    STAGE_LABEL_GATEKEEPER,
+    STAGE_LABEL_STANDARD,
+    STAGE_LABEL_SUPERSTAR,
     TARGET_COLUMN,
     calculate_wmape,
     engineer_stage3_features,
@@ -27,7 +39,7 @@ DATA_DIR = Path("data")
 MODELS_DIR = Path("models")
 
 FEATURE_MATRIX_PATH = DATA_DIR / "album_meta_features.parquet"
-CHARTEX_PATH = DATA_DIR / "chartex_velocity_training.csv"
+DAP_SOCIAL_PATH = DATA_DIR / "dap_social_pre_release.csv"
 CLASSIFIER_PATH = MODELS_DIR / "streaming_hurdle_classifier.txt"
 REGRESSOR_PATH = MODELS_DIR / "streaming_hurdle_regressor.joblib"
 SUPERSTAR_REGRESSOR_PATH = MODELS_DIR / "streaming_superstar_regressor.joblib"
@@ -42,29 +54,11 @@ VALIDATION_SIZE = 0.15
 RANDOM_STATE = 42
 EARLY_STOPPING_ROUNDS = 50
 
-CHARTEX_RAW_COLUMNS = [
-    "TRENDING_SOUNDS_COUNT",
-    "ALBUM_TOTAL_TT_VIDEOS",
-    "ALBUM_TT_VIDEOS_LAST_7D",
-    "ALBUM_TT_VIDEOS_LAST_24H",
-    "ALBUM_TOTAL_TT_VIEWS",
-    "ALBUM_TOTAL_TT_LIKES",
-    "ALBUM_TOTAL_TT_SAVES",
-    "ALBUM_TOTAL_TT_SHARES",
-]
-
-CHARTEX_ENGINEERED_COLUMNS = [
-    "TT_VIRAL_CONCENTRATION",
-    "TT_TERMINAL_ACCELERATION",
-    "TT_ENGAGEMENT_DEPTH",
-    "TT_LIKE_RATIO",
-]
-
-CHARTEX_FEATURES = CHARTEX_ENGINEERED_COLUMNS + [
-    "TRENDING_SOUNDS_COUNT",
-    "ALBUM_TOTAL_TT_VIEWS",
-    "ALBUM_TOTAL_TT_VIDEOS",
-]
+# Back-compat aliases used by backtests / inference loaders.
+CHARTEX_RAW_COLUMNS = DAP_SOCIAL_RAW_COLUMNS
+CHARTEX_ENGINEERED_COLUMNS = DAP_SOCIAL_ENGINEERED_COLUMNS
+CHARTEX_FEATURES = SOCIAL_FEATURES
+CHARTEX_PATH = DAP_SOCIAL_PATH
 
 
 class BoosterClassifierAdapter:
@@ -106,7 +100,7 @@ def load_primary_models() -> tuple[LGBMClassifier, LGBMRegressor, LGBMRegressor,
 
 
 def load_cohort_feature_matrix(path: Path, cohort_start: str) -> pd.DataFrame:
-    """Load parquet features and restrict to the 2026 Chartex training window."""
+    """Load parquet features and restrict to the social training window."""
     df = pd.read_parquet(path)
     df["FIRST_SALE_DATE"] = pd.to_datetime(df["FIRST_SALE_DATE"])
     cohort = df[df["FIRST_SALE_DATE"] >= pd.Timestamp(cohort_start)].copy()
@@ -145,50 +139,29 @@ def add_primary_predictions(
     return enriched
 
 
-def load_and_merge_chartex_features(cohort_df: pd.DataFrame, chartex_path: Path) -> pd.DataFrame:
-    """Left-join Chartex velocity features; missing TikTok metrics remain NaN."""
-    if not chartex_path.exists():
-        raise FileNotFoundError(f"Chartex training file not found: {chartex_path}")
+def load_and_merge_chartex_features(cohort_df: pd.DataFrame, social_path: Path) -> pd.DataFrame:
+    """Left-join DAP social features; missing metrics remain NaN for LightGBM."""
+    if not social_path.exists():
+        raise FileNotFoundError(
+            f"DAP social training file not found: {social_path}. "
+            "Run fetch_dap_social_features.py first."
+        )
 
-    chartex_df = pd.read_csv(chartex_path)
-    chartex_df.columns = chartex_df.columns.str.upper()
-    chartex_df = chartex_df.drop_duplicates(subset=["MRELG_ID"], keep="last")
+    social_df = pd.read_csv(social_path)
+    social_df.columns = social_df.columns.str.upper()
+    social_df = social_df.drop_duplicates(subset=["MRELG_ID"], keep="last")
 
-    merge_columns = ["MRELG_ID", *CHARTEX_RAW_COLUMNS]
-    missing_chartex_cols = set(merge_columns) - set(chartex_df.columns)
-    if missing_chartex_cols:
-        raise ValueError(f"Chartex CSV is missing required columns: {sorted(missing_chartex_cols)}")
+    merge_columns = ["MRELG_ID", *DAP_SOCIAL_RAW_COLUMNS]
+    missing_social_cols = set(merge_columns) - set(social_df.columns)
+    if missing_social_cols:
+        raise ValueError(f"DAP social CSV is missing required columns: {sorted(missing_social_cols)}")
 
-    merged = cohort_df.merge(chartex_df[merge_columns], on="MRELG_ID", how="left")
-    return merged
-
-
-def _safe_positive_denominator(series: pd.Series) -> pd.Series:
-    """Floor positive denominators at 1.0 while preserving NaN for missing TikTok data."""
-    values = series.astype(float)
-    safe_values = values.copy()
-    valid_mask = values.notna()
-    safe_values.loc[valid_mask] = np.maximum(values.loc[valid_mask], 1.0)
-    return safe_values
+    return cohort_df.merge(social_df[merge_columns], on="MRELG_ID", how="left")
 
 
 def engineer_chartex_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Build TikTok acceleration and engagement ratios for Stage 4."""
-    enriched = df.copy()
-    safe_total_videos = _safe_positive_denominator(enriched["ALBUM_TOTAL_TT_VIDEOS"])
-    safe_total_views = _safe_positive_denominator(enriched["ALBUM_TOTAL_TT_VIEWS"])
-
-    enriched["TT_VIRAL_CONCENTRATION"] = (
-        enriched["ALBUM_TT_VIDEOS_LAST_7D"] / safe_total_videos
-    )
-    enriched["TT_TERMINAL_ACCELERATION"] = (
-        enriched["ALBUM_TT_VIDEOS_LAST_24H"] / safe_total_videos
-    )
-    enriched["TT_ENGAGEMENT_DEPTH"] = (
-        enriched["ALBUM_TOTAL_TT_SAVES"] + enriched["ALBUM_TOTAL_TT_SHARES"]
-    ) / safe_total_views
-    enriched["TT_LIKE_RATIO"] = enriched["ALBUM_TOTAL_TT_LIKES"] / safe_total_views
-    return enriched
+    """Back-compat wrapper around DAP social feature engineering."""
+    return engineer_dap_social_features(df)
 
 
 def fill_gatekeeper_spb(df: pd.DataFrame) -> pd.DataFrame:
@@ -213,12 +186,24 @@ def fill_gatekeeper_spb(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_training_frame(cohort_df: pd.DataFrame) -> pd.DataFrame:
-    """Attach Chartex features, fill gatekeeper SPB, and compute log viral multiplier target."""
-    with_chartex = load_and_merge_chartex_features(cohort_df, CHARTEX_PATH)
-    engineered = engineer_chartex_features(with_chartex)
-    filled = fill_gatekeeper_spb(engineered)
+    """Attach DAP social features and build Stage 4 targets on the gated population.
 
-    train_df = filled[filled["PRIMARY_PREDICTED_SPB"] > 0].copy()
+    Training / evaluation population:
+      - Hurdle-routed Standard albums with real social signal, OR
+      - Any row with real social signal that is not Superstar
+    Superstar and no-social paths are excluded so Stage 4 cannot shrink them.
+    Gatekeeper rows are included only when they have real social (eval/train residual
+    on social signal), but primary SPB still uses the fallback fill for the ratio.
+    """
+    with_social = load_and_merge_chartex_features(cohort_df, DAP_SOCIAL_PATH)
+    engineered = engineer_dap_social_features(with_social)
+    filled = fill_gatekeeper_spb(engineered)
+    gated = annotate_social_gates(filled)
+
+    not_superstar = gated["PRIMARY_PREDICTION_STAGE"] != STAGE_LABEL_SUPERSTAR
+    eligible = gated["HAS_REAL_SOCIAL"] & not_superstar & (gated["PRIMARY_PREDICTED_SPB"] > 0)
+    train_df = gated.loc[eligible].copy()
+
     raw_ratio = train_df[TARGET_COLUMN] / train_df["PRIMARY_PREDICTED_SPB"]
     raw_ratio = raw_ratio.clip(lower=MULTIPLIER_MIN, upper=MULTIPLIER_MAX)
     train_df["VIRAL_MULTIPLIER"] = np.log(raw_ratio)
@@ -226,7 +211,7 @@ def build_training_frame(cohort_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_chartex_regressor() -> LGBMRegressor:
-    """Highly regularized Huber regressor for small-sample TikTok residual correction."""
+    """Highly regularized Huber regressor for small-sample social residual correction."""
     return LGBMRegressor(
         objective="huber",
         num_leaves=7,
@@ -246,12 +231,14 @@ def weighted_mape(actual: np.ndarray, predicted: np.ndarray) -> float:
     return calculate_wmape(actual, predicted) / 100.0
 
 
-def train_chartex_multiplier(train_df: pd.DataFrame) -> tuple[LGBMRegressor, dict[str, float]]:
-    """Train Stage 4 with grouped holdout early stopping and report residual metrics."""
+def train_chartex_multiplier(
+    train_df: pd.DataFrame,
+) -> tuple[LGBMRegressor, dict[str, float | bool], dict[str, float | bool]]:
+    """Train Stage 4 on gated rows; evaluate holdout health + wMAPE on that population."""
     if train_df.empty:
-        raise ValueError("Training frame is empty after preparing Chartex multiplier targets.")
+        raise ValueError("Training frame is empty after Stage 4 eligibility gating.")
 
-    X = train_df[CHARTEX_FEATURES]
+    X = train_df[SOCIAL_FEATURES]
     y = train_df["VIRAL_MULTIPLIER"]
     groups = train_df[GROUP_COLUMN]
 
@@ -283,52 +270,139 @@ def train_chartex_multiplier(train_df: pd.DataFrame) -> tuple[LGBMRegressor, dic
     primary_spb = val_df["PRIMARY_PREDICTED_SPB"].to_numpy(dtype=float)
     cascaded_spb = primary_spb * predicted_multiplier
 
-    metrics = {
+    health = assess_stage4_multiplier_health(predicted_multiplier)
+
+    # Primary evaluation: eligible holdout (routed-or-social gated frame).
+    metrics: dict[str, float | bool] = {
         "holdout_rows": float(len(val_df)),
         "multiplier_mae": float(mean_absolute_error(actual_multiplier, predicted_multiplier)),
         "baseline_wmape": weighted_mape(actual_spb, primary_spb),
         "cascaded_wmape": weighted_mape(actual_spb, cascaded_spb),
+        "median_multiplier": float(health["median_multiplier"]),
+        "p95_multiplier": float(health["p95_multiplier"]),
+        "mean_multiplier": float(health["mean_multiplier"]),
+        "stage4_enabled": bool(health["enabled"]),
     }
-    return model, metrics
+
+    # Secondary: viral-candidate subset within holdout.
+    viral_mask = val_df["IS_VIRAL_SOCIAL"].to_numpy(dtype=bool)
+    if viral_mask.any():
+        metrics["viral_holdout_rows"] = float(viral_mask.sum())
+        metrics["viral_baseline_wmape"] = weighted_mape(
+            actual_spb[viral_mask], primary_spb[viral_mask]
+        )
+        metrics["viral_cascaded_wmape"] = weighted_mape(
+            actual_spb[viral_mask], cascaded_spb[viral_mask]
+        )
+        metrics["viral_median_multiplier"] = float(np.median(predicted_multiplier[viral_mask]))
+    else:
+        metrics["viral_holdout_rows"] = 0.0
+        metrics["viral_baseline_wmape"] = float("nan")
+        metrics["viral_cascaded_wmape"] = float("nan")
+        metrics["viral_median_multiplier"] = float("nan")
+
+    # Standard-only slice (production apply population).
+    standard_mask = val_df["PRIMARY_PREDICTION_STAGE"].to_numpy() == STAGE_LABEL_STANDARD
+    if standard_mask.any():
+        metrics["standard_holdout_rows"] = float(standard_mask.sum())
+        metrics["standard_baseline_wmape"] = weighted_mape(
+            actual_spb[standard_mask], primary_spb[standard_mask]
+        )
+        metrics["standard_cascaded_wmape"] = weighted_mape(
+            actual_spb[standard_mask], cascaded_spb[standard_mask]
+        )
+    else:
+        metrics["standard_holdout_rows"] = 0.0
+        metrics["standard_baseline_wmape"] = float("nan")
+        metrics["standard_cascaded_wmape"] = float("nan")
+
+    return model, metrics, health
 
 
-def export_model(model: LGBMRegressor, metrics: dict[str, float]) -> None:
-    """Persist Stage 4 regressor and feature ordering for downstream inference."""
+def export_model(
+    model: LGBMRegressor,
+    metrics: dict[str, float | bool],
+    health: dict[str, float | bool],
+) -> None:
+    """Persist Stage 4 regressor, gates, and enablement flag for inference."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
         "regressor": model,
-        "chartex_features": CHARTEX_FEATURES,
+        "chartex_features": SOCIAL_FEATURES,
+        "social_features": SOCIAL_FEATURES,
         "multiplier_min": MULTIPLIER_MIN,
         "multiplier_max": MULTIPLIER_MAX,
         "target_transform": "log",
         "cohort_start_date": COHORT_START_DATE,
         "holdout_metrics": metrics,
+        "stage4_enabled": bool(health["enabled"]),
+        "health": health,
+        "real_social_min_views": REAL_SOCIAL_MIN_VIEWS,
+        "viral_terminal_acceleration_threshold": VIRAL_TERMINAL_ACCELERATION_THRESHOLD,
+        "application_policy": {
+            "allowed_stages": [STAGE_LABEL_STANDARD],
+            "require_real_social": True,
+            "exclude_superstar": True,
+            "exclude_no_social": True,
+            "exclude_gatekeeper": True,
+        },
     }
     joblib.dump(payload, OUTPUT_MODEL_PATH)
 
 
-def print_summary(cohort_df: pd.DataFrame, train_df: pd.DataFrame, metrics: dict[str, float]) -> None:
-    """Print training cohort and holdout evaluation summary."""
-    routed_mask = cohort_df["PRIMARY_PREDICTED_SPB"].notna()
-    gatekeeper_filled = int((~routed_mask).sum())
+def print_summary(
+    cohort_df: pd.DataFrame,
+    train_df: pd.DataFrame,
+    metrics: dict[str, float | bool],
+    health: dict[str, float | bool],
+) -> None:
+    """Print gated training / holdout evaluation summary."""
+    stage_col = "PRIMARY_PREDICTION_STAGE"
+    routed_mask = cohort_df[stage_col] != STAGE_LABEL_GATEKEEPER
     print("\n" + "=" * 72)
-    print("STAGE 4 — CHARTEX VIRAL MULTIPLIER TRAINING")
+    print("STAGE 4 — DAP SOCIAL VIRAL MULTIPLIER (GATED)")
     print("=" * 72)
     print(f"Cohort start date:              {COHORT_START_DATE}")
     print(f"2026 cohort rows:               {len(cohort_df):,}")
-    print(f"Hurdle-routed primary SPB:        {int(routed_mask.sum()):,}")
-    print(f"Gatekeeper rows (fallback SPB):   {gatekeeper_filled:,}")
-    print(f"Stage 4 training rows:          {len(train_df):,}")
-    print(f"Target transform:               log (cap [{MULTIPLIER_MIN}, {MULTIPLIER_MAX}])")
-    print(f"Chartex feature count:          {len(CHARTEX_FEATURES)}")
+    print(f"Hurdle-routed rows:             {int(routed_mask.sum()):,}")
+    print(f"Gatekeeper rows:                {int((~routed_mask).sum()):,}")
+    print(f"Eligible Stage 4 train rows:    {len(train_df):,}")
+    print(f"  Standard + social:            {int((train_df[stage_col]==STAGE_LABEL_STANDARD).sum()):,}")
+    print(f"  Gatekeeper + social:          {int((train_df[stage_col]==STAGE_LABEL_GATEKEEPER).sum()):,}")
+    print(f"  Viral candidates in train:    {int(train_df['IS_VIRAL_SOCIAL'].sum()):,}")
+    print(f"Real social min views:          {REAL_SOCIAL_MIN_VIEWS:,.0f}")
+    print(f"Viral accel threshold:          {VIRAL_TERMINAL_ACCELERATION_THRESHOLD}")
     print("-" * 72)
-    print("Holdout Evaluation (15% artist-group split)")
+    print("Holdout Evaluation (eligible population only)")
     print(f"  Holdout rows:                 {int(metrics['holdout_rows']):,}")
-    print(f"  Multiplier MAE:               {metrics['multiplier_mae']:.4f}")
-    print(f"  Baseline wMAPE (SPB):         {metrics['baseline_wmape']:.2%}")
-    print(f"  Cascaded wMAPE (SPB):         {metrics['cascaded_wmape']:.2%}")
-    print(f"  wMAPE improvement:            {(metrics['baseline_wmape'] - metrics['cascaded_wmape']):.2%} absolute")
+    print(f"  Multiplier MAE:               {float(metrics['multiplier_mae']):.4f}")
+    print(f"  Median multiplier:            {float(metrics['median_multiplier']):.3f}x")
+    print(f"  P95 multiplier:               {float(metrics['p95_multiplier']):.3f}x")
+    print(f"  Baseline wMAPE (SPB):         {float(metrics['baseline_wmape']):.2%}")
+    print(f"  Cascaded wMAPE (SPB):         {float(metrics['cascaded_wmape']):.2%}")
+    print(
+        f"  wMAPE improvement:            "
+        f"{(float(metrics['baseline_wmape']) - float(metrics['cascaded_wmape'])):.2%} absolute"
+    )
+    if float(metrics["standard_holdout_rows"]) > 0:
+        print(
+            f"  Standard-only cascaded Δ:     "
+            f"{(float(metrics['standard_baseline_wmape']) - float(metrics['standard_cascaded_wmape'])):.2%} "
+            f"(n={int(metrics['standard_holdout_rows'])})"
+        )
+    if float(metrics["viral_holdout_rows"]) > 0:
+        print(
+            f"  Viral-candidate cascaded Δ:   "
+            f"{(float(metrics['viral_baseline_wmape']) - float(metrics['viral_cascaded_wmape'])):.2%} "
+            f"(n={int(metrics['viral_holdout_rows'])})"
+        )
     print("-" * 72)
+    enabled = bool(health["enabled"])
+    print(
+        f"Stage 4 production enablement:  "
+        f"{'ENABLED' if enabled else 'DISABLED'} "
+        f"(need median in [0.85, 1.15] and p95 >= 1.50)"
+    )
     print(f"Saved model to:                 {OUTPUT_MODEL_PATH}")
     print("=" * 72 + "\n")
 
@@ -344,9 +418,9 @@ def main() -> None:
         metadata,
     )
     train_df = build_training_frame(cohort_df)
-    model, metrics = train_chartex_multiplier(train_df)
-    export_model(model, metrics)
-    print_summary(cohort_df, train_df, metrics)
+    model, metrics, health = train_chartex_multiplier(train_df)
+    export_model(model, metrics, health)
+    print_summary(cohort_df, train_df, metrics, health)
 
 
 if __name__ == "__main__":

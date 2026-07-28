@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -17,11 +16,18 @@ import pandas as pd
 from lightgbm import LGBMRegressor
 from scipy.stats import linregress
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
-
+from dap_social_features import (
+    DAP_SOCIAL_ENGINEERED_COLUMNS,
+    DAP_SOCIAL_RAW_COLUMNS,
+    LIVE_DAP_SOCIAL_SQL,
+    SOCIAL_FEATURES,
+    dap_social_row_is_empty,
+    engineer_dap_social_row,
+    has_real_social_signal,
+    is_viral_social_candidate,
+    should_apply_stage4,
+)
+from snowflake_client import get_snowflake_connection
 from train_streaming_hurdle import (
     FEATURE_COLUMNS,
     STAGE3_FEATURE_COLUMNS,
@@ -32,6 +38,10 @@ from train_streaming_hurdle import (
     gatekeeper_predict_proba,
     predict_pipeline,
 )
+
+# Back-compat aliases for Stage 4 social feature names.
+CHARTEX_RAW_COLUMNS = DAP_SOCIAL_RAW_COLUMNS
+CHARTEX_ENGINEERED_COLUMNS = DAP_SOCIAL_ENGINEERED_COLUMNS
 
 DATA_DIR = Path("data")
 MODELS_DIR = Path("models")
@@ -54,13 +64,6 @@ GATEKEEPER_PROB_THRESHOLD = 0.5 #default that should get replaced by optimal fro
 RAW_STREAM_FLOOR = 500.0
 DEFAULT_TRACKS = 12
 DEFAULT_HITS = 1
-SNOWFLAKE_ENV_PATH = Path("secrets/amg_research.env")
-SNOWFLAKE_BASE_ENV_VARS = (
-    "SNOWFLAKE_USER",
-    "SNOWFLAKE_ACCOUNT",
-    "SNOWFLAKE_WAREHOUSE",
-    "SNOWFLAKE_ROLE",
-)
 LIVE_CATALOG_SQL = """
 SELECT
     FLOOR(DATEDIFF(DAY, asd.report_date, %(anchor_date)s) / 7) AS weeks_prior_to_release,
@@ -78,56 +81,6 @@ WHERE asd.COUNTRY_CODE = 'AA'
 GROUP BY ALL
 ORDER BY weeks_prior_to_release ASC
 """
-LIVE_CHARTEX_SQL = """
-WITH artist_meta AS (
-    SELECT artist_name
-    FROM CURRENT_DEV.DATA.ARTIST_METADATA
-    WHERE luminate_artist_id = %(artist_id)s
-    LIMIT 1
-),
-chartex_snapshots AS (
-    SELECT ctd.*
-    FROM CURRENT_DEV.DATA.CHARTEX_TIKTOK_DATA ctd
-    JOIN artist_meta am ON LOWER(ctd.artists) = LOWER(am.artist_name)
-    WHERE DATE(ctd.created_at) <= %(anchor_date)s
-),
-pre_release_velocity AS (
-    SELECT *
-    FROM chartex_snapshots
-    QUALIFY ROW_NUMBER() OVER(
-        PARTITION BY tiktok_sound_id
-        ORDER BY created_at DESC
-    ) = 1
-)
-SELECT
-    COUNT(DISTINCT tiktok_sound_id) AS trending_sounds_count,
-    SUM(tiktok_total_video_count) AS album_total_tt_videos,
-    SUM(tiktok_last_7_days_video_count) AS album_tt_videos_last_7d,
-    SUM(tiktok_last_24_hours_video_count) AS album_tt_videos_last_24h,
-    SUM(total_video_views) AS album_total_tt_views,
-    SUM(total_video_likes) AS album_total_tt_likes,
-    SUM(total_video_saves) AS album_total_tt_saves,
-    SUM(total_video_shares) AS album_total_tt_shares
-FROM pre_release_velocity
-"""
-
-CHARTEX_RAW_COLUMNS = [
-    "TRENDING_SOUNDS_COUNT",
-    "ALBUM_TOTAL_TT_VIDEOS",
-    "ALBUM_TT_VIDEOS_LAST_7D",
-    "ALBUM_TT_VIDEOS_LAST_24H",
-    "ALBUM_TOTAL_TT_VIEWS",
-    "ALBUM_TOTAL_TT_LIKES",
-    "ALBUM_TOTAL_TT_SAVES",
-    "ALBUM_TOTAL_TT_SHARES",
-]
-
-CHARTEX_ENGINEERED_COLUMNS = [
-    "TT_VIRAL_CONCENTRATION",
-    "TT_TERMINAL_ACCELERATION",
-    "TT_ENGAGEMENT_DEPTH",
-    "TT_LIKE_RATIO",
-]
 
 _peer_benchmarks_cache: pd.DataFrame | None = None
 
@@ -173,7 +126,13 @@ def parse_args() -> argparse.Namespace:
         "--artist-id",
         type=str,
         default=None,
-        help="Luminate Artist ID for real-time Snowflake catalog and Chartex extraction",
+        help="Luminate Artist ID for real-time Snowflake catalog metric extraction",
+    )
+    parser.add_argument(
+        "--mrelg-id",
+        type=str,
+        default=None,
+        help="Album MRELG_ID for DAP social pre-release feature lookup",
     )
     parser.add_argument(
         "--first-sale-date",
@@ -235,101 +194,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_snowflake_env() -> None:
-    """Load Snowflake credentials from secrets/amg_research.env."""
-    if not SNOWFLAKE_ENV_PATH.exists():
-        raise EnvironmentError(
-            f"Snowflake env file not found: {SNOWFLAKE_ENV_PATH}. "
-            "Copy secrets/amg_research.env.example and fill in credentials."
-        )
-
-    if load_dotenv is not None:
-        load_dotenv(SNOWFLAKE_ENV_PATH)
-
-
-def _load_snowflake_private_key() -> bytes:
-    """Load a PKCS#8 private key for Snowflake key-pair authentication."""
-    try:
-        from cryptography.hazmat.backends import default_backend
-        from cryptography.hazmat.primitives import serialization
-    except ImportError as exc:
-        raise ImportError(
-            "cryptography is required for Snowflake key-pair auth. "
-            "Install with: pip install cryptography"
-        ) from exc
-
-    key_path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
-    key_pem = os.getenv("SNOWFLAKE_PRIVATE_KEY")
-    passphrase = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
-
-    if key_path:
-        key_data = Path(key_path).expanduser().read_bytes()
-    elif key_pem:
-        key_data = key_pem.replace("\\n", "\n").encode()
-    else:
-        raise EnvironmentError(
-            "Key-pair auth requires SNOWFLAKE_PRIVATE_KEY_PATH or SNOWFLAKE_PRIVATE_KEY."
-        )
-
-    private_key = serialization.load_pem_private_key(
-        key_data,
-        password=passphrase.encode() if passphrase else None,
-        backend=default_backend(),
-    )
-    return private_key.private_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-
-
-def get_snowflake_connection():
-    """Open a Snowflake connection using secrets/amg_research.env credentials."""
-    try:
-        import snowflake.connector
-    except ImportError as exc:
-        raise ImportError(
-            "snowflake-connector-python is required for live catalog extraction. "
-            f"Install with: {sys.executable} -m pip install snowflake-connector-python "
-            "(current interpreter: "
-            f"{sys.executable})"
-        ) from exc
-
-    load_snowflake_env()
-    missing = [var for var in SNOWFLAKE_BASE_ENV_VARS if not os.getenv(var)]
-    if missing:
-        raise EnvironmentError(
-            f"Missing Snowflake environment variables: {', '.join(missing)}"
-        )
-
-    connect_kwargs: dict[str, Any] = {
-        "user": os.environ["SNOWFLAKE_USER"],
-        "account": os.environ["SNOWFLAKE_ACCOUNT"],
-        "warehouse": os.environ["SNOWFLAKE_WAREHOUSE"],
-        "role": os.environ["SNOWFLAKE_ROLE"],
-    }
-
-    database = os.getenv("SNOWFLAKE_DATABASE")
-    schema = os.getenv("SNOWFLAKE_SCHEMA")
-    if database:
-        connect_kwargs["database"] = database
-    if schema:
-        connect_kwargs["schema"] = schema
-
-    auth_method = os.getenv("SNOWFLAKE_AUTH_METHOD", "password").lower()
-    if auth_method == "key_pair":
-        connect_kwargs["private_key"] = _load_snowflake_private_key()
-    else:
-        password = os.getenv("SNOWFLAKE_PASSWORD")
-        if not password:
-            raise EnvironmentError(
-                "Password auth requires SNOWFLAKE_PASSWORD in secrets/amg_research.env."
-            )
-        connect_kwargs["password"] = password
-
-    return snowflake.connector.connect(**connect_kwargs)
-
-
 def compute_catalog_velocity_slope(weekly_catalog: pd.DataFrame) -> float:
     """Mirror build_streaming_features.compute_catalog_velocity on a weekly frame."""
     sorted_weeks = weekly_catalog.sort_values("WEEKS_PRIOR_TO_RELEASE", ascending=False)
@@ -370,48 +234,8 @@ def resolve_anchor_date(first_sale_date: str | None) -> str:
     return anchor_date_obj.strftime("%Y-%m-%d")
 
 
-def _chartex_row_is_empty(chartex_row: pd.Series | None) -> bool:
-    """True when Chartex returned no usable TikTok aggregates before the anchor date."""
-    if chartex_row is None or chartex_row.empty:
-        return True
-    values = chartex_row.reindex(CHARTEX_RAW_COLUMNS)
-    return bool(values.isna().all())
-
-
-def _safe_ratio(numerator: Any, denominator: float) -> float:
-    """Divide safely, preserving NaN when the numerator is missing."""
-    if pd.isna(numerator):
-        return np.nan
-    return float(numerator) / denominator
-
-
-def engineer_live_chartex_features(chartex_row: pd.Series) -> dict[str, float]:
-    """Engineer TikTok ratios for inference; empty rows propagate NaN to LightGBM."""
-    engineered: dict[str, float] = {col: np.nan for col in CHARTEX_ENGINEERED_COLUMNS}
-    if _chartex_row_is_empty(chartex_row):
-        return engineered
-
-    safe_total_videos = max(float(chartex_row["ALBUM_TOTAL_TT_VIDEOS"] or 0.0), 1.0)
-    safe_total_views = max(float(chartex_row["ALBUM_TOTAL_TT_VIEWS"] or 0.0), 1.0)
-
-    engineered["TT_VIRAL_CONCENTRATION"] = _safe_ratio(
-        chartex_row["ALBUM_TT_VIDEOS_LAST_7D"], safe_total_videos
-    )
-    engineered["TT_TERMINAL_ACCELERATION"] = _safe_ratio(
-        chartex_row["ALBUM_TT_VIDEOS_LAST_24H"], safe_total_videos
-    )
-    engineered["TT_ENGAGEMENT_DEPTH"] = _safe_ratio(
-        chartex_row["ALBUM_TOTAL_TT_SAVES"] + chartex_row["ALBUM_TOTAL_TT_SHARES"],
-        safe_total_views,
-    )
-    engineered["TT_LIKE_RATIO"] = _safe_ratio(
-        chartex_row["ALBUM_TOTAL_TT_LIKES"], safe_total_views
-    )
-    return engineered
-
-
-def fetch_live_snowflake_metrics(artist_id: str, anchor_date: str) -> dict[str, Any]:
-    """Pull live catalog velocity and Chartex TikTok aggregates anchored to a release date."""
+def fetch_live_catalog_metrics(artist_id: str, anchor_date: str) -> dict[str, float]:
+    """Pull live catalog velocity metrics anchored to a release date."""
     connection = get_snowflake_connection()
     try:
         cursor = connection.cursor()
@@ -421,13 +245,6 @@ def fetch_live_snowflake_metrics(artist_id: str, anchor_date: str) -> dict[str, 
         )
         catalog_rows = cursor.fetchall()
         catalog_columns = [col[0] for col in cursor.description]
-
-        cursor.execute(
-            LIVE_CHARTEX_SQL,
-            {"artist_id": artist_id, "anchor_date": anchor_date},
-        )
-        chartex_rows = cursor.fetchall()
-        chartex_columns = [col[0] for col in cursor.description]
     finally:
         connection.close()
 
@@ -445,33 +262,57 @@ def fetch_live_snowflake_metrics(artist_id: str, anchor_date: str) -> dict[str, 
         float
     )
 
-    catalog_velocity_slope = compute_catalog_velocity_slope(weekly_catalog)
-    short_term_spike_ratio = compute_short_term_spike_ratio(weekly_catalog)
-
-    chartex_row: pd.Series | None = None
-    if chartex_rows:
-        chartex_df = pd.DataFrame(chartex_rows, columns=chartex_columns)
-        chartex_df.columns = chartex_df.columns.str.upper()
-        chartex_row = chartex_df.iloc[0]
-
-    raw_chartex: dict[str, float] = {col: np.nan for col in CHARTEX_RAW_COLUMNS}
-    if not _chartex_row_is_empty(chartex_row):
-        assert chartex_row is not None
-        for col in CHARTEX_RAW_COLUMNS:
-            value = chartex_row.get(col, np.nan)
-            raw_chartex[col] = np.nan if pd.isna(value) else float(value)
-
-    engineered_chartex = engineer_live_chartex_features(
-        chartex_row if chartex_row is not None else pd.Series(dtype=float)
-    )
-
     return {
-        "anchor_date": anchor_date,
-        "catalog_velocity_slope": catalog_velocity_slope,
-        "short_term_spike_ratio": short_term_spike_ratio,
-        **raw_chartex,
-        **engineered_chartex,
+        "catalog_velocity_slope": compute_catalog_velocity_slope(weekly_catalog),
+        "short_term_spike_ratio": compute_short_term_spike_ratio(weekly_catalog),
     }
+
+
+def fetch_live_dap_social_metrics(mrelg_id: str) -> dict[str, float]:
+    """Pull DAP TT/YT pre-release social aggregates for one album."""
+    connection = get_snowflake_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(LIVE_DAP_SOCIAL_SQL, {"mrelg_id": mrelg_id})
+        social_rows = cursor.fetchall()
+        social_columns = [col[0] for col in cursor.description]
+    finally:
+        connection.close()
+
+    raw_social: dict[str, float] = {col: np.nan for col in DAP_SOCIAL_RAW_COLUMNS}
+    if not social_rows:
+        return {**raw_social, **engineer_dap_social_row(pd.Series(dtype=float))}
+
+    social_df = pd.DataFrame(social_rows, columns=social_columns)
+    social_df.columns = social_df.columns.str.upper()
+    social_row = social_df.iloc[0]
+
+    if not dap_social_row_is_empty(social_row):
+        for col in DAP_SOCIAL_RAW_COLUMNS:
+            value = social_row.get(col, np.nan)
+            raw_social[col] = np.nan if pd.isna(value) else float(value)
+
+    return {**raw_social, **engineer_dap_social_row(social_row)}
+
+
+def fetch_live_snowflake_metrics(
+    artist_id: str | None,
+    anchor_date: str,
+    mrelg_id: str | None = None,
+) -> dict[str, Any]:
+    """Pull live catalog velocity and/or DAP social features from Snowflake."""
+    metrics: dict[str, Any] = {"anchor_date": anchor_date}
+
+    if artist_id:
+        metrics.update(fetch_live_catalog_metrics(artist_id, anchor_date))
+
+    if mrelg_id:
+        metrics.update(fetch_live_dap_social_metrics(mrelg_id))
+    else:
+        metrics.update({col: np.nan for col in DAP_SOCIAL_RAW_COLUMNS})
+        metrics.update({col: np.nan for col in DAP_SOCIAL_ENGINEERED_COLUMNS})
+
+    return metrics
 
 
 def format_streams(value: float) -> str:
@@ -671,16 +512,38 @@ def apply_stage4_multiplier(
     stage4_payload: dict[str, Any],
 ) -> tuple[float, float]:
     """Exponentiate the log-multiplier prediction and cascade onto primary SPB."""
-    chartex_features: list[str] = stage4_payload["chartex_features"]
+    chartex_features: list[str] = stage4_payload.get(
+        "social_features",
+        stage4_payload.get("chartex_features", SOCIAL_FEATURES),
+    )
     stage4_model: LGBMRegressor = stage4_payload["regressor"]
     multiplier_min = float(stage4_payload.get("multiplier_min", 0.1))
     multiplier_max = float(stage4_payload.get("multiplier_max", 100.0))
+
+    missing = [col for col in chartex_features if col not in synthetic_row.index]
+    if missing:
+        raise KeyError(f"Stage 4 row missing social features: {missing}")
 
     X_stage4 = pd.DataFrame([synthetic_row[chartex_features].to_dict()])
     predicted_log_multiplier = float(stage4_model.predict(X_stage4)[0])
     viral_multiplier = float(np.clip(np.exp(predicted_log_multiplier), multiplier_min, multiplier_max))
     final_spb = primary_spb * viral_multiplier
     return final_spb, viral_multiplier
+
+
+def describe_stage4_skip_reason(reason: str) -> str:
+    """Human-readable Stage 4 skip reason for terminal reports."""
+    mapping = {
+        "stage4_model_missing": "Stage 4 model not loaded",
+        "stage4_health_gate_failed": (
+            "Stage 4 disabled — multipliers not centered near 1.0 with viral right tail"
+        ),
+        "no_real_social_signal": "No real social signal (max TT/YT views < 1,000,000)",
+        f"stage_excluded:{STAGE_LABEL_SUPERSTAR}": "Superstar path excluded from Stage 4",
+        f"stage_excluded:{STAGE_LABEL_GATEKEEPER}": "Gatekeeper path excluded from Stage 4",
+        f"stage_excluded:{STAGE_LABEL_STANDARD}": "Standard path unexpectedly excluded",
+    }
+    return mapping.get(reason, reason)
 
 
 def load_regressor_payload(path: Path) -> LGBMRegressor:
@@ -962,12 +825,20 @@ def print_single_shot_report(
     final_streams: float,
     viral_multiplier: float | None,
     current_market_size: int,
+    stage4_status: str | None = None,
 ) -> None:
     """Print a single-artist ML forecast with optional Stage 4 cascade details."""
     stage_label = STAGE_DISPLAY_LABELS.get(prediction_stage, prediction_stage)
     active_singles = row.get("ACTIVE_SINGLE_COUNT", np.nan)
     lead_peak = row.get("LEAD_SINGLE_PEAK_VOLUME", np.nan)
     retention = row.get("RETENTION_RATIO", np.nan)
+    has_social = has_real_social_signal(row.get("TT_TOTAL_VIEWS"), row.get("YT_TOTAL_VIEWS"))
+    is_viral = is_viral_social_candidate(
+        row.get("TT_TOTAL_VIEWS"),
+        row.get("YT_TOTAL_VIEWS"),
+        row.get("TT_TERMINAL_ACCELERATION"),
+        row.get("YT_TERMINAL_ACCELERATION"),
+    )
 
     print("\n" + "=" * 72)
     print("ML SINGLE-SHOT INFERENCE — WEEK 1 ALBUM STREAM FORECAST")
@@ -982,12 +853,14 @@ def print_single_shot_report(
     print(f"  Retention Ratio:       {format_percent(float(retention)) if pd.notna(retention) else 'N/A'}")
     print(f"  Gatekeeper Prob:       {probability:.1%}")
     print(f"  Prediction Stage:      {stage_label}")
+    print(f"  Real Social Signal:    {'yes' if has_social else 'no'}")
+    print(f"  Viral Social Candidate:{'yes' if is_viral else 'no'}")
     if not np.isnan(primary_spb):
         print(f"  Primary Predicted SPB: {format_spb(primary_spb)}")
     if viral_multiplier is not None:
-        print(
-            f"  [Cascaded Stage 4 Multiplier Applied: {viral_multiplier:.2f}x]"
-        )
+        print(f"  [Cascaded Stage 4 Multiplier Applied: {viral_multiplier:.2f}x]")
+    elif stage4_status:
+        print(f"  Stage 4:               skipped — {describe_stage4_skip_reason(stage4_status)}")
     if not np.isnan(final_spb):
         print(f"  Final Predicted SPB:   {format_spb(final_spb)}")
     print(f"  WEEK 1 FORECAST:       {format_streams(final_streams)} streams")
@@ -1000,7 +873,7 @@ def run_single_shot_inference(
     current_market_size: int,
     stage4_payload: dict[str, Any] | None = None,
 ) -> None:
-    """Score one synthetic rollout row, optionally cascading Stage 4 Chartex multiplier."""
+    """Score one synthetic rollout row, optionally cascading Stage 4 under gated policy."""
     peer_benchmarks = load_peer_benchmarks()
     classifier, regressor, superstar_regressor, metadata = load_ml_artifacts()
 
@@ -1041,13 +914,21 @@ def run_single_shot_inference(
     probability = float(probabilities[0])
     primary_spb = float(predicted_spb[0]) if not np.isnan(predicted_spb[0]) else np.nan
     viral_multiplier: float | None = None
+    stage4_status: str | None = None
     final_spb = primary_spb
 
     if stage == STAGE_LABEL_GATEKEEPER or np.isnan(primary_spb):
         final_streams = standard_release_fallback(row, current_market_size, peer_benchmarks)
         final_spb = np.nan
+        stage4_status = f"stage_excluded:{STAGE_LABEL_GATEKEEPER}"
     else:
-        if stage4_payload is not None:
+        apply, stage4_status = should_apply_stage4(
+            prediction_stage=stage,
+            row=row,
+            stage4_payload=stage4_payload,
+            standard_stage_label=STAGE_LABEL_STANDARD,
+        )
+        if apply and stage4_payload is not None:
             final_spb, viral_multiplier = apply_stage4_multiplier(
                 primary_spb, row, stage4_payload
             )
@@ -1067,6 +948,7 @@ def run_single_shot_inference(
         final_streams=final_streams,
         viral_multiplier=viral_multiplier,
         current_market_size=current_market_size,
+        stage4_status=stage4_status,
     )
 
 
@@ -1172,20 +1054,52 @@ def main() -> None:
 
         anchor_date = resolve_anchor_date(args.first_sale_date)
         live_metrics: dict[str, Any] | None = None
-        if args.artist_id:
+
+        # Prefer explicit --mrelg-id; otherwise hydrate history first to discover one.
+        historical_mrelg_id: str | None = None
+        if not args.mrelg_id and args.artist:
+            if FEATURE_MATRIX_PATH.exists():
+                history_df = pd.read_parquet(FEATURE_MATRIX_PATH)
+                matches = history_df[
+                    history_df["DISPLAY_ARTIST"].str.lower() == args.artist.strip().lower()
+                ]
+                if not matches.empty and "MRELG_ID" in matches.columns:
+                    matches = matches.sort_values("FIRST_SALE_DATE", ascending=False)
+                    historical_mrelg_id = str(matches.iloc[0]["MRELG_ID"])
+
+        resolved_mrelg_id = args.mrelg_id or historical_mrelg_id
+
+        if args.artist_id or resolved_mrelg_id:
             try:
-                live_metrics = fetch_live_snowflake_metrics(args.artist_id, anchor_date)
+                live_metrics = fetch_live_snowflake_metrics(
+                    artist_id=args.artist_id,
+                    anchor_date=anchor_date,
+                    mrelg_id=resolved_mrelg_id,
+                )
             except (EnvironmentError, ImportError, ValueError) as exc:
                 print(f"Error: Failed to fetch live Snowflake metrics: {exc}", file=sys.stderr)
                 sys.exit(1)
 
             print("\nLive Snowflake Metrics:")
             print("-" * 72)
-            print(f"  ARTIST_ID:                {args.artist_id}")
+            if args.artist_id:
+                print(f"  ARTIST_ID:                {args.artist_id}")
+            if resolved_mrelg_id:
+                print(f"  MRELG_ID:                 {resolved_mrelg_id}")
             print(f"  Anchor Date:              {anchor_date}")
-            print(f"  CATALOG_VELOCITY_SLOPE:   {live_metrics['catalog_velocity_slope']:,.2f}")
-            print(f"  SHORT_TERM_SPIKE_RATIO:   {live_metrics['short_term_spike_ratio']:.4f}")
-            for col in CHARTEX_RAW_COLUMNS:
+            if live_metrics.get("catalog_velocity_slope") is not None and not pd.isna(
+                live_metrics.get("catalog_velocity_slope", np.nan)
+            ):
+                print(f"  CATALOG_VELOCITY_SLOPE:   {live_metrics['catalog_velocity_slope']:,.2f}")
+                print(f"  SHORT_TERM_SPIKE_RATIO:   {live_metrics['short_term_spike_ratio']:.4f}")
+            for col in [
+                "TT_TOTAL_VIEWS",
+                "TT_VIEWS_LAST_7D",
+                "TT_VIEWS_LAST_24H",
+                "YT_TOTAL_VIEWS",
+                "YT_VIEWS_LAST_7D",
+                "YT_VIEWS_LAST_24H",
+            ]:
                 value = live_metrics.get(col, np.nan)
                 print(f"  {col}: {value if pd.isna(value) else f'{value:,.0f}'}")
 
